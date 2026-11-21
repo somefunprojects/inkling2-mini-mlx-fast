@@ -1,4 +1,4 @@
-"""megafix (REVIEW_MEGA2 F1): FastDecoder steps fed KNOWN tokens with no host sync between them.
+"""megafix: FastDecoder steps fed KNOWN tokens with no host sync between them.
 KVIP writes the KV rows in place, invisible to MLX; across steps only an explicit dependency (the
 qsm kernel's ``dep`` input) orders step t+1's write after step t's SDPA read of that slot.
 Modes, all with forced tokens (no data path from step t's logits to step t+1):

@@ -1,6 +1,6 @@
 """attn_res kernel vs stock _attn_res_keys / attn_res_prefix (bitwise).
 
-megafix (REVIEW_MEGA M1/L3/L4): every (B, L) with B*L <= 16 the gate can admit (L in {1, 2, 8},
+megafix: every (B, L) with B*L <= 16 the gate can admit (L in {1, 2, 8},
 B*L = 16), N = nk + 1 up to 13 (Metal buffer-slot bound; 14, 20 must be gated), f32 / bf16 partial (raw_partial too) and bf16 / f32 query.
 Shapes the gate refuses are counted, not run, except in the "gate needed" section, which runs the
 kernel ungated at shapes past the gemv split-K bound (D < 16 * rows * N) to show the gate is

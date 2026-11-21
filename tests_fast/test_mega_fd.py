@@ -2,7 +2,7 @@
 Run with the same INKLING_FAST list as the target config plus the mega flags;
 each mega attribute is toggled off for the reference decoder.
 
-megafix (REVIEW_MEGA L4):
+megafix:
 - MEGA_ATTRS defaults to every mega attribute plus ``attnres`` (was mega_ctrl
   only); with TINY_WIDE=1 (D 1024) the attnres kernel engages, so this is its
   end-to-end tiny test.  The reference decoder then runs the xpass/keys path.
@@ -45,7 +45,7 @@ if os.environ.get("TINY_WIDE", "0") == "1":
         return c
     tiny.tiny_config = _wide
 if os.environ.get("TINY_REAL", "0") == "1":
-    # megafix (REVIEW_MEGA2 F4): the real model's attention/residual dims
+    # megafix: the real model's attention/residual dims
     # (D 2304 -> every gemv D%1024 tail branch, HQ 24, HK 8, head_dim 128,
     # d_rel 16, gate rank 64) on the tiny depth/expert count.
     _orig_cfg2 = tiny.tiny_config
@@ -71,7 +71,7 @@ BATCH = int(os.environ.get("BATCH", "1"))
 SPEC = int(os.environ.get("SPEC", "0"))
 FAILS = []
 STEPS = int(os.environ.get("STEPS", "40"))  # T0=1000 + 40 crosses p = cap-1 = 1023 and the growth
-# REVIEW_MEGAPERF P1: module-level INKLING_FAST flags (fk.enabled() at call
+# module-level INKLING_FAST flags (fk.enabled() at call
 # time, e.g. mega_rg2, mega_dpar, mega_qsm2, mega_oproj2) are dropped for the
 # reference decoder too, so the test compares them against their parents.
 MEGA_FLAGS = [a for a in os.environ.get("MEGA_FLAGS", "").split(",") if a]
