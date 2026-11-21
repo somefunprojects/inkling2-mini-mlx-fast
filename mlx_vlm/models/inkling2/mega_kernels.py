@@ -174,7 +174,7 @@ def _get(name, src, inputs, outputs):
 def ctrl_supported(x, dw, fw=None, gw=None, n_ctrl=None):
     """dw [n, R, 2D], fw/gw [n, D, R] (or one controller's 2-D weights,
     n = 1), all BF16: the kernels cast them to device bfloat16_t* and index
-    them as dense [n, D, R] (REVIEW_MEGA L1)."""
+    them as dense [n, D, R]."""
     D = x.shape[-1]
     R = dw.shape[-2]
     n = dw.shape[0] if dw.ndim == 3 else 1
@@ -288,7 +288,7 @@ def norm_supported(x, weight):
 
 def rms_norm_cast(xs, ws, eps):
     """[RMSNorm(w_i)(x_i).astype(bf16) for i] in one launch. x_i: [..., D] f32
-    with one row (any strides); w_i: [D] bf16 (any stride; REVIEW_MEGA L2).
+    with one row (any strides); w_i: [D] bf16 (any stride).
     Returns [n, D] bf16."""
     n = len(xs)
     D = xs[0].shape[-1]
@@ -422,7 +422,7 @@ def dsconv_supported(mod, x, dyn_in, state):
         and C % mod.num_heads == 0
         and D % 4 == 0
         # the kernel hard-codes MLX's split-K gemv tile (bm1 bn8): stock picks
-        # it only for K > 64 and K >= 16 * out rows (REVIEW_MEGA2 F7)
+        # it only for K > 64 and K >= 16 * out rows
         and D > 64
         and D >= 16 * w.shape[0]
     )
@@ -783,8 +783,8 @@ def post_supported(module, state, attn, x, n_keys, query):
         and 1 <= n_keys + 1 <= 32
         # 31 Metal buffer slots: nki keys + 9 inputs + 5 outputs (megafix)
         and n_keys + 14 <= 31
-        # threadgroup pk/bk/ov[D] + red/sc/wts/part floats <= 32 KB (REVIEW_MEGA2 F8)
-        # + mega_dpar's pv2[N*8] and ex[N], N = n_keys + 1 (REVIEW_MEGAPERF P4)
+        # threadgroup pk/bk/ov[D] + red/sc/wts/part floats <= 32 KB
+        # + mega_dpar's pv2[N*8] and ex[N], N = n_keys + 1
         and (3 * D + 32 + 2 * 32 + 8 + _dpar_tg_floats(n_keys)) * 4 <= 32 * 1024
     )
 
@@ -1011,7 +1011,7 @@ def qkv_sink_mask(q, k, v, r, attn, cfg, tau, xin, proj, q_pos, ncol, window, ga
     kernel), (b) not need the old buffer contents (the FD state is replaced
     every step and each visit owns its buffers).
 
-    Cross-step (REVIEW_MEGA2 F1): this step writes slot p (k/v) over what the
+    Cross-step: this step writes slot p (k/v) over what the
     previous step's SDPA read as its zero sink row.  MLX tracks only arrays a
     kernel *outputs*, so nothing orders that write-after-read unless this
     kernel has an input written after the previous SDPA.  ``dep`` (never read
@@ -1042,7 +1042,7 @@ def qkv_sink_mask(q, k, v, r, attn, cfg, tau, xin, proj, q_pos, ncol, window, ga
         src = src.replace(kw, kw + """
                 if (KVIP) {
                     device T* kbw = (device T*)kbuf;
-                    // [1, HK, KS, HD] by strides (REVIEW_MEGA2 F6; FD buffers are dense today)
+                    // [1, HK, KS, HD] by strides
                     const size_t bi = (size_t)h * kbuf_strides[1] + (size_t)qpos[0] * kbuf_strides[2]
                                       + (size_t)((int)lane * 4 + i) * kbuf_strides[3];
                     kbw[bi] = o;
@@ -1051,7 +1051,7 @@ def qkv_sink_mask(q, k, v, r, attn, cfg, tau, xin, proj, q_pos, ncol, window, ga
         src = src.replace(vw, vw + """
                 if (KVIP) {
                     device T* vbw = (device T*)vbuf;
-                    // [1, HK, KS, HD] by strides (REVIEW_MEGA2 F6; FD buffers are dense today)
+                    // [1, HK, KS, HD] by strides
                     const size_t bi = (size_t)h * vbuf_strides[1] + (size_t)qpos[0] * vbuf_strides[2]
                                       + (size_t)((int)lane * 4 + i) * vbuf_strides[3];
                     vbw[bi] = o;
@@ -1063,8 +1063,8 @@ def qkv_sink_mask(q, k, v, r, attn, cfg, tau, xin, proj, q_pos, ncol, window, ga
         # constants share one buffer (same f32 values: bitwise unchanged).
         assert (src.count("rthr[0]"), src.count("thr[0]"), src.count("eps[0]"), "cst" in src) == (2, 3, 1, False)
         src = src.replace("rthr[0]", "cst[1]").replace("thr[0]", "cst[0]").replace("eps[0]", "cst[2]")
-        # integ: megaperf's qsm2 rewrite runs AFTER megafix's cst rewrite
-        # (REVIEW_MEGAPERF P5); its anchors don't touch the constants.  Kernel
+        # megaperf's qsm2 rewrite runs AFTER megafix's cst rewrite;
+        # its anchors don't touch the constants.  Kernel
         # names stay distinct (inkling2_mega_qsm / _qsm2): MLX caches compiled
         # libraries by name.
         if v2:
@@ -1256,7 +1256,7 @@ def oproj_supported(o_proj, att, gate):
     """Bitwise only for a row-major o_proj.weight: stock ``x @ w.T`` then runs
     the non-transposed gemv this kernel copies; a transposed/column view
     would send stock to gemv_t (other K order) while the kernel follows
-    strides.  REVIEW_MEGA2 F9: MLX's Python API exposes no strides/flags to
+    strides.  MLX's Python API exposes no strides/flags to
     check here; checkpoint weights are dense row-major, so this stays a
     documented precondition (assigning a transposed view to o_proj.weight
     breaks bitwise, not correctness)."""
@@ -1363,7 +1363,7 @@ def pre_supported(module, state, routes, residual, n_keys, query):
         and 1 <= n_keys + 1 <= 32
         # 31 Metal buffer slots: nki keys + 10 inputs + 5 outputs (megafix)
         and n_keys + 15 <= 31
-        # same threadgroup arrays as post_block (REVIEW_MEGA2 F8, REVIEW_MEGAPERF P4)
+        # same threadgroup arrays as post_block
         and (3 * D + 32 + 2 * 32 + 8 + _dpar_tg_floats(n_keys)) * 4 <= 32 * 1024
     )
 
@@ -1410,7 +1410,7 @@ def pre_block(module, state, routes, residual, weights, keys, query, norm=None):
 
 # --------------------------------------------------------------------------
 # 15. mega_sdpa: exact decode SDPA (B=1, L=1, float mask, no sinks= arg)
-#     reading the KV buffers in place (megaperf2, 2026-11-21).
+#     reading the KV buffers in place (megaperf2).
 # --------------------------------------------------------------------------
 # Reproduces, bit for bit, the MLX 0.32.4 kernels (ml-explore/mlx, MIT,
 # kernels/sdpa_vector.h; dispatch in scaled_dot_product_attention.cpp) that
@@ -1726,7 +1726,7 @@ def sdpa_supported(q, kb, vb, mask, N, gather=False, ring=None):
         and vb.dtype == q.dtype and mask.dtype == q.dtype
         and D % 32 == 0 and kb.shape[3] == D and vb.shape == kb.shape
         and hq % hk == 0 and tuple(mask.shape) == (1, hq, 1, N)
-        # REVIEW_SDPA S3 (integ): the kernel reads rows by index with no
+        # the kernel reads rows by index with no
         # bounds check: sliced reads rows 0..N-1; gather reads ring slots and
         # the zero row at index RING.
         and (kb.shape[2] == ring + 1 if gather else N <= kb.shape[2])
@@ -1737,7 +1737,7 @@ _sdpa_selftest = {}
 
 
 def sdpa_selftest(hq, hk, D, window, ring, dtype=mx.bfloat16):
-    """REVIEW_SDPA S1 (integ): one 1-pass and one 2-pass replica call vs
+    """one 1-pass and one 2-pass replica call vs
     ``mx.fast.scaled_dot_product_attention`` on random operands (sliced
     regime, as tests_fast/test_sdpa.py).  False on any mismatch: catches MLX
     routing / Metal-compiler FMA drift that the version pin cannot.  Cached

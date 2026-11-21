@@ -31,7 +31,7 @@ import gpu_stats
 OUT = os.path.join(RUNS, "spec_bench.jsonl")
 
 
-# ---------------------------------------------------------------- pure helpers (unit-testable on the mini)
+# ---------------------------------------------------------------- pure helpers (unit-testable without a model)
 def first_divergence(got, ref):
     """Index of the first differing token over the common length, or None if the common prefix matches."""
     for i, (a, b) in enumerate(zip(got, ref)):

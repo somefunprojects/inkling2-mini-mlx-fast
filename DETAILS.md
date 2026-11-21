@@ -91,7 +91,7 @@ We use two labels:
 
 ## Repo layout and licences
 
-- `mlx_vlm/models/inkling2/`: new files (`fast_decode.py`, `fast_kernels.py`, `mega_kernels.py`, `verify_dedup.py`, plus `batch_kernels.py` on `batch` and `spec_attn.py`, `spec_kernels.py`, `spec_moe.py` on `specfast`), modified upstream `language.py` and `kernels.py`, and `tests_fast/`.
+- `mlx_vlm/models/inkling2/`: new files (`fast_decode.py`, `fast_kernels.py`, `mega_kernels.py`, `verify_dedup.py`, plus `batch_kernels.py` on `batch` only, and `spec_attn.py`, `spec_kernels.py`, `spec_moe.py` on both `batch` and `specfast`; `main` has none of them. `batch` carries the spec files because its B-row kernels reuse them, but the speculative path is documented and reviewed on `specfast` only), modified upstream `language.py` and `kernels.py`, and `tests_fast/`.
 - `mlx_vlm/quantization/nvfp4.py`: modified upstream file caching a per-expert scale factor.
 - `tests_fast/`, `tests.txt`, `run_tests.sh`, `bench/`, `install.sh`, `UPSTREAM_LANGUAGE_SHA256`, `LICENSE`, `LICENSE-APACHE`.
 
