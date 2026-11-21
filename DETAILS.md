@@ -57,17 +57,17 @@ Prefill is essentially unchanged; the real speedups are in decode.
 
 ### Batched decode (`batch` branch, drafting off, aggregate tok/s)
 
-Measured on equal-length rows of overlapping 512-token Python stdlib slices (all code, no chat, about 80% overlap between neighbours), 128 decode steps:
+Measured on equal-length rows of 512 tokens that share no tokens with each other (distinct prompts: even rows are natural-language passages, odd rows non-overlapping code and documentation slices), 128 decode steps, sampler off, 3 repetitions in one session, spread at most 3.3%:
 
-| Context | B | FastDecoder (no BATCHFAST) | Ours (`BATCHFAST=all`) | Drafting | Exactness |
-|---|---|---|---|---|---|
-| 512 | 4 | 155.2 | 208.6 | Off | NONBITWISE-OK |
-| 512 | 8 | 234.9 | 287.8 | Off | NONBITWISE-OK |
-| 512 | 16 | 303.0 | 344.5 (reps 340.5 / 348.4) | Off | NONBITWISE-OK |
-| 2K | 4 | 147.7 | 199.6 | Off | NONBITWISE-OK |
-| 2K | 16 | 273.8 | 330.9 | Off | NONBITWISE-OK |
+| Context | B | FastDecoder (no BATCHFAST) | Ours (`BATCHFAST=all`) | Stock `mlx-vlm` | Drafting | Exactness |
+|---|---|---|---|---|---|---|
+| 512 | 4 | 153.7 | 222.2 | 111.1 | Off | NONBITWISE-OK |
+| 512 | 8 | 232.6 | 321.8 | 175.6 | Off | NONBITWISE-OK |
+| 512 | 16 | 301.6 | 420.1 | 249.7 | Off | NONBITWISE-OK |
 
-For rough reference, stock `mlx-vlm` batched decode measured 111.1 / 175.6 / 249.7 tok/s at B=4 / 8 / 16 in a separate session, so only the two columns in the table above are a direct same-session comparison. At B=1 with `BATCHFAST` enabled, output stays bitwise exact (256/256 steps across 8 prompts).
+The two middle columns come from the same session on the same rows. The stock column is from a separate session. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stays bitwise exact.
+
+Only the NVFP4 MoE layers use the new batched kernels. The 4 MXFP8 MoE layers still use stock kernels. The batched MoE path falls back to stock above B=16 (with a one-time warning on stderr).
 
 ## Correctness gates
 
@@ -82,7 +82,7 @@ We use two labels:
 
 - Context past 131072 tokens: plain decode falls back to stock; the speculative path currently crashes past 131072 (a fix exists and will land in a later update).
 - Verify-pass KL near context 1000-1256: KL exceeds the 2.68e-3 bar even on the base (non-`specfast`) path, reaching 6.82e-3 for `specfast` at n=3 before settling back down at 2000. Our original gate prompts did not cross ~1024.
-- Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs partly on stock paths without warning, no chat batch test, MXFP8 MoE layers still use stock kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
+- Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs the MoE layers on stock kernels (one-time warning), no chat batch test, MXFP8 MoE layers still use stock kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
 - Unequal-length (left-padded) batches are refused unless `INKLING_FAST_DECODE_PADDED=1` is set, and that mode is not bitwise (KL about 1e-3).
 - A reference cycle keeps KV buffers alive until Python GC runs, which matters for long-running servers.
 - `attnres` at L>1 is not FP32-tested.
