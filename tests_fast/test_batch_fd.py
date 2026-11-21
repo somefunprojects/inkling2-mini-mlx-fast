@@ -139,3 +139,10 @@ for dtype, tol in ((mx.float32, 1e-4), (mx.bfloat16, None)):
         print(f"e2e tiny {str(dtype)[-8:]} B={B} argmax equal: {same}", flush=True)
     del lm
 print("BATCH_FD", "PASS" if OK else "FAIL")
+
+# (4) probe (test_batch_fd_probe.py): padded rows of 8 lengths crossing window / rel_extent / buckets at
+# different steps, NB>1 split + combine SDPA (BSDPA_BLOCK=8), row isolation, bf16 per-token ablation.
+import runpy  # noqa: E402
+_ns = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_batch_fd_probe.py"))
+OK &= not _ns["FAIL"]
+print("BATCH_FD", "PASS" if OK else "FAIL", "(incl. probe)")
