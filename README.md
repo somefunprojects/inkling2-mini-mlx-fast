@@ -1,6 +1,6 @@
 # inkling2-mini-mlx-fast
 
-This is a small speed overlay for running the Inkling 2 Mini model (text path only) on Apple Silicon with MLX, built on top of `mlx-vlm`. It keeps the official released weights completely untouched and cuts per-token GPU overhead with a compiled decode loop and custom Metal kernels. On our Mac, that roughly doubles plain decoding speed while producing the exact same output, and everything sits behind opt-in flags so default runs still behave like stock `mlx-vlm`.
+This is a small speed overlay for running the Inkling 2 Mini model (text path only) on Apple Silicon with MLX, built on top of `mlx-vlm`. It keeps the official released weights completely untouched and cuts per-token GPU overhead with a compiled decode loop and custom Metal kernels. On our Mac, that roughly doubles plain decoding speed compared with stock `mlx-vlm` while producing the exact same output, and everything sits behind opt-in flags so default runs still behave like stock `mlx-vlm`.
 
 ## What we measured
 
@@ -8,10 +8,12 @@ Here is what we measured on our own Mac (Apple M5 Ultra, 64-core GPU, 96 GB unif
 
 | Mode | Context | Drafting | Baseline (tok/s) | Ours (tok/s) | Bit-exact? |
 |---|---|---|---|---|---|
-| Plain (`main`) | 512 | Off | 37.3 (stock) | 75.6 (2.03x) | Yes |
-| Plain (`main`) | 4K | Off | 35.4 (stock) | 73.5 (2.08x) | Yes |
+| Plain (`main`) | 512 | Off | 37.3 (stock `mlx-vlm`) | 75.6 (2.03x) | Yes |
+| Plain (`main`) | 4K | Off | 35.4 (stock `mlx-vlm`) | 73.5 (2.08x) | Yes |
 | Speculative (`specfast`) | <=4K | On | 78.2 / 76.3 (plain) | 102.7 mean (1.31x) | No, within noise bar |
-| Batched, B=4/8/16 (`batch`), aggregate tok/s, distinct prompts | 512 | Off | 153.7 / 232.6 / 301.6 (our plain path; stock: 111.1 / 175.6 / 249.7) | 222.2 / 321.8 / 420.1 | No, within noise bar (up to 4K context) |
+| Batched, B=4/8/16 (`batch`), aggregate tok/s, distinct prompts | 512 | Off | 153.7 / 232.6 / 301.6 (our plain path; stock `mlx-vlm`: 111.1 / 175.6 / 249.7) | 222.2 / 321.8 / 420.1 | No, within noise bar (up to 4K context) |
+
+For reference, stock `mlx-lm` (the fork at commit 0c4c991) on the same machine decodes at 45.0 tok/s at 4K context, so our plain decode is about 1.6-1.7x stock `mlx-lm`. Its prefill runs at 3.3-3.7K tok/s, and ours is currently slower (about 2.8-2.9K at 4K). Other engines on the same machine are faster at B=1 decode: [inkling-infer by razorback16 is faster once context passes 1K, 109 tok/s on our machine](https://github.com/razorback16/inkling-infer). Details and methods are in [DETAILS.md](DETAILS.md).
 
 "Bit-exact" means every decoding step produces identical logits to unmodified `mlx-vlm`; the speculative and batched modes reorder some math and allow tiny differences that stay within stock `mlx-vlm`'s own run-to-run noise. This project is a work in progress, and corrections or bug reports are always welcome. See [DETAILS.md](DETAILS.md) for long-context runs, prefill timings, correctness gates, known limits, and all runtime flags.
 

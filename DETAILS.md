@@ -8,7 +8,7 @@ The overlay targets Python 3.12, MLX 0.32.4, and `mlx-vlm` at commit `fd6404fb32
 
 Three branches hold the reviewed code as-is (only licence headers and comment wording were edited):
 
-- `main`: plain B=1 decode and stock-compatible batching.
+- `main`: plain B=1 decode and batching that stays compatible with stock `mlx-vlm`.
 - `batch`: `main` plus `INKLING_BATCHFAST` kernels for B>1 decode.
 - `specfast`: `main` plus `INKLING_SPECFAST` kernels for speculative decoding with the model's bundled DSpark drafter.
 
@@ -26,7 +26,7 @@ To run benchmarks, build prompts with `INKLING_MODEL=/path/to/Inkling-2-Mini INK
 
 ## Test machine and weights
 
-Every number below was measured on a Mac with an Apple M5 Ultra (64-core GPU, `applegpu_g17d`, 96 GB unified memory), macOS 27.2.1, Python 3.12, MLX 0.32.4, and `mlx-vlm` at `fd6404fb`. Decoding is greedy, B=1 unless noted, and the GPU-utilisation sampler is off during timing. "Stock" means unmodified `mlx-vlm` at that commit with no flags.
+Every number below was measured on a Mac with an Apple M5 Ultra (64-core GPU, `applegpu_g17d`, 96 GB unified memory), macOS 27.2.1, Python 3.12, MLX 0.32.4, and `mlx-vlm` at `fd6404fb`. Decoding is greedy, B=1 unless noted, and the GPU-utilisation sampler is off during timing. "Stock `mlx-vlm`" means unmodified `mlx-vlm` at that commit with no flags.
 
 Weights are the shipped Inkling 2 Mini release with no requantization: NVFP4 experts in layers 0-19, MXFP8 experts in layers 20-23, and bf16 for attention, controllers, router, embedding, and LM head.
 
@@ -36,10 +36,10 @@ Weights are the shipped Inkling 2 Mini release with no requantization: NVFP4 exp
 
 | Path (branch) | Context | Drafting | Baseline | Ours | Speedup | Exactness |
 |---|---|---|---|---|---|---|
-| Plain (`main`) | 512 | Off | 37.3 (stock) | 75.6 (rerun 75.9) | 2.03x | BITWISE |
-| Plain (`main`) | 4K | Off | 35.4 (stock) | 73.5 (rerun 73.7) | 2.08x | BITWISE |
-| Plain, raw code (`main`)* | 32K | Off | 32.4 (stock) | 70.2 | 2.17x | BITWISE |
-| Plain, raw code (`main`)* | 128K | Off | 22.3 (stock) | 53.3 | 2.40x | No verdict |
+| Plain (`main`) | 512 | Off | 37.3 (stock `mlx-vlm`) | 75.6 (rerun 75.9) | 2.03x | BITWISE |
+| Plain (`main`) | 4K | Off | 35.4 (stock `mlx-vlm`) | 73.5 (rerun 73.7) | 2.08x | BITWISE |
+| Plain, raw code (`main`)* | 32K | Off | 32.4 (stock `mlx-vlm`) | 70.2 | 2.17x | BITWISE |
+| Plain, raw code (`main`)* | 128K | Off | 22.3 (stock `mlx-vlm`) | 53.3 | 2.40x | No verdict |
 | Spec, n=3 (`specfast`) | <=4K | On | 78.2 / 76.3 (plain 512 / 4K) | 102.7 mean (chat 86.0, code 112.3, doc 106.3) | 1.31x | NONBITWISE-OK |
 | Spec, raw code, n=3 (`specfast`)* | 4K | On | 77.0 (plain) | 131.3 | 1.71x | Unchecked |
 | Spec, raw code, n=3 (`specfast`)* | 16K | On | 73.3 (plain) | 120.3 | 1.64x | Unchecked |
@@ -51,7 +51,7 @@ Weights are the shipped Inkling 2 Mini release with no requantization: NVFP4 exp
 
 Prefill is essentially unchanged; the real speedups are in decode.
 
-- 512 / 1K / 4K (harness): 2375 / 2729 / 2920 vs 2206 / 2873 / 2766 stock. The 1K dip is a harness artifact; measured without it, prefill is about 2940 vs 2790.
+- 512 / 1K / 4K (harness): 2375 / 2729 / 2920 vs 2206 / 2873 / 2766 for stock `mlx-vlm`. The 1K dip is a harness artifact; measured without it, prefill is about 2940 vs 2790.
 - Model-level prefill: about 2900-2980 vs about 2846 at 1K, and about 2905 vs about 2752 at 4K.
 - Long context: 2370 vs 2281 at 32K, and about 1264 vs about 1228 at 128K.
 
@@ -65,25 +65,43 @@ Measured on equal-length rows of 512 tokens that share no tokens with each other
 | 512 | 8 | 232.6 | 321.8 | 175.6 | Off | NONBITWISE-OK |
 | 512 | 16 | 301.6 | 420.1 | 249.7 | Off | NONBITWISE-OK |
 
-The two middle columns come from the same session on the same rows. The stock column is from a separate session. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stays bitwise exact.
+The two middle columns come from the same session on the same rows. The stock `mlx-vlm` column is from a separate session. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stays bitwise exact.
 
-Only the NVFP4 MoE layers use the new batched kernels. The 4 MXFP8 MoE layers still use stock kernels. The batched MoE path falls back to stock above B=16 (with a one-time warning on stderr).
+Only the NVFP4 MoE layers use the new batched kernels. The 4 MXFP8 MoE layers still use stock `mlx-vlm` kernels. The batched MoE path falls back to stock `mlx-vlm` above B=16 (with a one-time warning on stderr).
+
+### Reference points from other engines (same machine)
+
+We ran two other engines on the same Mac to see where we stand. They use their own prompt handling, so treat the comparison as rough. Batch 1, bf16 KV cache, median of 3 repetitions after 1 warm-up, spread at most 0.3%. Weights are the same released Inkling 2 Mini checkpoint, loaded read-only. Prompts are token ids from our stdlib-source prompt builder.
+
+Stock `mlx-lm` (the `jundot/mlx-lm` fork at commit 0c4c991, which `inkling-infer` pins):
+
+| Metric | Stock `mlx-lm` | Ours (`main`) |
+|---|---|---|
+| Decode, 16-token prompt | 45.8 | 82.0 |
+| Decode, 4000-token context | 45.0 | 76.7 |
+| Prefill, 1K to 4K prompt (chunk 2048 / 1024) | about 3.3-3.7K | about 2.8-2.9K |
+| Prefill, 16K prompt | 3.3K / 3.1K | 2.6K |
+
+Our plain decode is therefore about 1.6-1.7x stock `mlx-lm` (73.5 / 45.0 with the harness numbers above, 76.7 / 45.0 in this same-session check). Our prefill is currently slower than stock `mlx-lm`, by roughly 15-30% depending on length. We have not yet investigated why.
+
+[inkling-infer](https://github.com/razorback16/inkling-infer) (repo commit 87d0e22), run locally with its own scripts and unmodified code: decode is 109.1 tok/s at 4000-token context, faster than ours (76.7 in the same check), and about 67 tok/s for prompts under 1K (ours: 82.0). Its fast path appears to engage once the sliding-window ring buffers fill, around 1K of context. Its prefill kernels measured 1.9-2.2K tok/s here, below ours and below its own stock path. Its decode is not bitwise with stock `mlx-lm` (teacher-forced mean KL 1.3-1.8e-3 over 41 steps, 2-3 argmax flips per run). We read its code for safety only and copied nothing.
 
 ## Correctness gates
 
 We use two labels:
 
-- `BITWISE`: logits identical to stock at every step. This holds for plain B=1 decode (0 differing steps out of 2048 across 8 prompts x 256), ~1K and ~8K starts (0/512), equal-length batches without `BATCHFAST`, 32K (2 prompts), and 64K (1 prompt). With `SPECFAST` off, the `specfast` branch also matches stock 512/512. At 96K and 128K stock is not reproducible against itself, so there is no verdict.
-- `NONBITWISE-OK`: top-64 teacher-forced KL against stock stays under 2.68e-3, which is the stock-vs-stock noise measured when only the prefill chunk size changes from 2048 to 1024 (8 prompts x 256 steps, calibrated on prompts up to 4K; not meaningful at 96K+).
+- `BITWISE`: logits identical to stock `mlx-vlm` at every step. This holds for plain B=1 decode (0 differing steps out of 2048 across 8 prompts x 256), ~1K and ~8K starts (0/512), equal-length batches without `BATCHFAST`, 32K (2 prompts), and 64K (1 prompt). With `SPECFAST` off, the `specfast` branch also matches stock `mlx-vlm` 512/512. At 96K and 128K stock `mlx-vlm` is not reproducible against itself, so there is no verdict.
+- `NONBITWISE-OK`: top-64 teacher-forced KL against stock `mlx-vlm` stays under 2.68e-3, which is the run-to-run noise of stock `mlx-vlm` against itself measured when only the prefill chunk size changes from 2048 to 1024 (8 prompts x 256 steps, calibrated on prompts up to 4K; not meaningful at 96K+).
   - `BATCHFAST` at B>1 measures 2.1e-4 to 7.2e-4 mean KL at 256 context, with worst cases of 1.55e-3 at 1K and 1.61e-3 at 4K.
   - `SPECFAST` measures 1.72e-3 KL64 at n=3 and 1.52e-3 at n=4. Tiny FP32 verify tests pass with TF32 off (row diffs up to 1.9e-6).
 
 ## Known limits
 
-- Context past 131072 tokens: plain decode falls back to stock; the speculative path currently crashes past 131072 (a fix exists and will land in a later update).
+- Context past 131072 tokens: plain decode falls back to stock `mlx-vlm`; the speculative path currently crashes past 131072 (a fix exists and will land in a later update).
 - Verify-pass KL near context 1000-1256: KL exceeds the 2.68e-3 bar even on the base (non-`specfast`) path, reaching 6.82e-3 for `specfast` at n=3 before settling back down at 2000. Our original gate prompts did not cross ~1024.
-- Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs the MoE layers on stock kernels (one-time warning), no chat batch test, MXFP8 MoE layers still use stock kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
+- Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs the MoE layers on stock `mlx-vlm` kernels (one-time warning), no chat batch test, MXFP8 MoE layers still use stock `mlx-vlm` kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
 - Unequal-length (left-padded) batches are refused unless `INKLING_FAST_DECODE_PADDED=1` is set, and that mode is not bitwise (KL about 1e-3).
+- Prefill is currently slower than stock `mlx-lm` (about 2.8-2.9K vs 3.3-3.7K tok/s at 1K-4K) and has not been investigated.
 - A reference cycle keeps KV buffers alive until Python GC runs, which matters for long-running servers.
 - `attnres` at L>1 is not FP32-tested.
 - Multi-turn KV reuse for agent-style serving is still WIP and not in this repo.
