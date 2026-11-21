@@ -1580,10 +1580,9 @@ class FastDecoder:
         captures = tuple(captures)
         if self.fallback is None:
             self._fit_bounded(1)
-        if self.fallback is not None:
-            raise Unsupported("step_captures: static state handed off to stock")
-        if self.pos + 1 > self.cap:
-            self._grow(self.pos + 1)  # Unsupported past the largest bucket
+        if self.fallback is not None or not self._room_or_hand_off(1):
+            logits, nxt = self.step(tokens)  # stock path past the largest bucket
+            return logits, nxt, None  # no captures: the caller must stop drafting
         self._ensure_head_cache(tokens.shape[0])
         key = ("step",) + captures
         fn = self._spec_compiled.get(key)
@@ -1608,18 +1607,19 @@ class FastDecoder:
         captures list of [B,L,D]).  Nothing here syncs the host.  The host
         position estimate becomes an upper bound (+L per round); refresh it
         with ``observe(accepted)`` when accepted counts reach the host.
-        Requires ring_extra >= L - 1.
+        Requires ring_extra >= L - 1. Past the largest bucket the state is handed
+        to the stock cache like step(); that round and later ones decode the
+        anchor only (``_stock_round``: accepted 0, no captures, fallback=True).
         """
         tokens = tokens.astype(mx.int32)
         B, L = tokens.shape
         if L - 1 > self.ring - self.window:
             raise ValueError(f"verify L={L} needs ring_extra >= {L - 1}")
-        if self.fallback is not None:
-            raise Unsupported("static state handed off to stock")
-        self._settle_kvip()  # verify reads/copies rows a kvip step wrote in place
-        self._fit_bounded(L)  # review F1 / D5: bucket from the true position when it is determined
-        if self.pos + L > self.cap:
-            self._grow(self.pos + L)  # Unsupported past the largest bucket
+        if self.fallback is None:
+            self._settle_kvip()  # verify reads/copies rows a kvip step wrote in place
+            self._fit_bounded(L)  # review F1 / D5: bucket from the true position when it is determined
+        if self.fallback is not None or not self._room_or_hand_off(L):
+            return self._stock_round(tokens)
         self._ensure_head_cache(B * L)
         captures = tuple(captures)
         key = captures
@@ -1638,6 +1638,45 @@ class FastDecoder:
         self._rounds.append(L)
         return dict(logits=logits, target=target, accepted=accepted,
                     emitted=emitted, bonus=bonus, captures=caps)
+
+    def _room_or_hand_off(self, L):
+        """Make room for L more tokens. Past the largest bucket, hand the state to
+        the stock cache (as step() does) and return False. The host bound
+        ``pos`` over-counts unobserved verify rounds, so before handing off,
+        retry with the exact device position (one host sync, only at this edge)."""
+        if self.pos + L <= self.cap:
+            return True
+        try:
+            self._grow(self.pos + L)
+            return True
+        except Unsupported:
+            pass
+        need = int(mx.max(self.state["q_pos"]).item()) + L
+        if need <= self.cap:
+            return True
+        try:
+            self._grow(need)
+            return True
+        except Unsupported:
+            _loud(f"FastDecoder: position {need} past the largest bucket; continuing on the stock path")
+            self.fallback = self.to_cache()
+            self.state = None
+            return False
+
+    def _stock_round(self, tokens):
+        """spec_step after the stock hand-off: decode the anchor only (drafts
+        rejected, accepted = 0, bonus = stock argmax). Same dict as spec_step but
+        logits/target are [B, 1, ...] and captures is empty, so a drafter has
+        nothing to draft from: callers should switch to step() once
+        ``self.fallback`` is set (speculative_loop does)."""
+        B, L = tokens.shape
+        logits = self.lm(inputs=tokens[:, :1], cache=self.fallback).logits[:, -1:]
+        target = mx.argmax(logits, axis=-1).astype(mx.int32)  # [B, 1]
+        bonus = target[:, 0]
+        emitted = mx.concatenate([target, mx.full((B, L - 1), -1, mx.int32)], axis=1)
+        self._rounds.append(1)  # observe([0]) advances the host position by 1
+        return dict(logits=logits, target=target, accepted=mx.zeros((B,), mx.int32),
+                    emitted=emitted, bonus=bonus, captures=[], fallback=True)
 
     @property
     def pos(self):
@@ -1812,7 +1851,7 @@ def speculative_loop(dec, anchor, draft_fn, n, max_tokens, captures=(),
 
     def drain(res):
         acc, em = res["accepted"].tolist(), res["emitted"].tolist()
-        if n:
+        if n and not res.get("plain"):  # step() advances the host position itself
             dec.observe(acc)
         for b in range(B):
             if done[b]:
@@ -1824,10 +1863,10 @@ def speculative_loop(dec, anchor, draft_fn, n, max_tokens, captures=(),
                     break
 
     while True:
-        if n == 0:
+        if n == 0 or dec.fallback is not None:  # plain decode (also past the largest bucket)
             logits, nxt = dec.step(rs["anchor"][:, None])
             res = dict(accepted=mx.zeros((B,), mx.int32), emitted=nxt[:, None],
-                       bonus=nxt, captures=[], logits=logits[:, None])
+                       bonus=nxt, captures=[], logits=logits[:, None], plain=True)
         else:
             drafts = draft_fn(rs).astype(mx.int32)
             tokens = mx.concatenate([rs["anchor"][:, None], drafts], axis=1)
@@ -1836,7 +1875,7 @@ def speculative_loop(dec, anchor, draft_fn, n, max_tokens, captures=(),
         rounds += 1
         if on_round is not None:
             on_round(rounds, res)
-        rs = dict(anchor=res["bonus"], q_pos=dec.state["q_pos"],
+        rs = dict(anchor=res["bonus"], q_pos=None if dec.state is None else dec.state["q_pos"],
                   captures=res["captures"], accepted=res["accepted"])
         if pending is not None:
             drain(pending)  # previous round: already finished or nearly so
@@ -1848,7 +1887,7 @@ def speculative_loop(dec, anchor, draft_fn, n, max_tokens, captures=(),
     # step()/spec_step() then fit the bucket from the true position). The state
     # then includes that round's tokens, which may run past EOS / max_tokens
     # (they are not in the returned lists).
-    if n and pending is not None and dec._rounds:
+    if n and pending is not None and not pending.get("plain") and dec._rounds:
         dec.observe(pending["accepted"].tolist())
     return [o[:max_tokens] for o in out], rounds
 
