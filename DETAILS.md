@@ -79,10 +79,11 @@ Stock `mlx-lm` (the `jundot/mlx-lm` fork at commit 0c4c991, which `inkling-infer
 |---|---|---|
 | Decode, 16-token prompt | 45.8 | 82.0 |
 | Decode, 4000-token context | 45.0 | 76.7 |
-| Prefill, 1K to 4K prompt (chunk 2048 / 1024) | about 3.3-3.7K | about 2.8-2.9K |
-| Prefill, 16K prompt | 3.3K / 3.1K | 2.6K |
+| Prefill, 4,096 tokens, 1,024-token chunks, no `lm_head` | 3,344 | 3,122 |
 
-Our plain decode is therefore about 1.6-1.7x stock `mlx-lm` (73.5 / 45.0 with the harness numbers above, 76.7 / 45.0 in this same-session check). Our prefill is currently slower than stock `mlx-lm`, by roughly 15-30% depending on length. We have not yet investigated why.
+Our plain decode is therefore about 1.6-1.7x stock `mlx-lm` (73.5 / 45.0 with the harness numbers above, 76.7 / 45.0 in this same-session check). Measured the same way, our prefill is about 7% slower than stock `mlx-lm`: a fresh 4,096-token cache, 1,024-token chunks, hidden state and cache evaluated per chunk, `lm_head` never run, median of 5 repetitions. Per 1,024-token chunk that is 290 / 310 / 316 / 305 ms for stock `mlx-lm` and 306 / 331 / 332 / 338 ms for ours (chunk offsets 0 / 1K / 2K / 3K). Timing the two components separately points to attention: stock `mlx-lm` uses one fused relative-attention kernel, while ours builds a dense mask and calls SDPA. The MoE experts take the same time in both (about 130 ms per chunk), and our short convolution is faster.
+
+Other prefill figures differ by definition and are not directly comparable with this row: stock `mlx-lm` reaches up to about 3.7K tok/s with a 2,048-token chunk and no `lm_head`, and the prefill figures in the Prefill section above come from a harness that also computes the last-row logits.
 
 [inkling-infer](https://github.com/razorback16/inkling-infer) (repo commit 87d0e22), run locally with its own scripts and unmodified code: decode is 109.1 tok/s at 4000-token context, faster than ours (76.7 in the same check), and about 67 tok/s for prompts under 1K (ours: 82.0). Its fast path appears to engage once the sliding-window ring buffers fill, around 1K of context. Its prefill kernels measured 1.9-2.2K tok/s here, below ours and below its own stock path. Its decode is not bitwise with stock `mlx-lm` (teacher-forced mean KL 1.3-1.8e-3 over 41 steps, 2-3 argmax flips per run). We read its code for safety only and copied nothing.
 
@@ -101,7 +102,7 @@ We use two labels:
 - Verify-pass KL near context 1000-1256: KL exceeds the 2.68e-3 bar even on the base (non-`specfast`) path, reaching 6.82e-3 for `specfast` at n=3 before settling back down at 2000. Our original gate prompts did not cross ~1024.
 - Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs the MoE layers on stock `mlx-vlm` kernels (one-time warning), no chat batch test, MXFP8 MoE layers still use stock `mlx-vlm` kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
 - Unequal-length (left-padded) batches are refused unless `INKLING_FAST_DECODE_PADDED=1` is set, and that mode is not bitwise (KL about 1e-3).
-- Prefill is currently slower than stock `mlx-lm` (about 2.8-2.9K vs 3.3-3.7K tok/s at 1K-4K) and has not been investigated.
+- Prefill is about 7% slower than stock `mlx-lm` when both are timed the same way (see the reference-points section); the difference is in attention.
 - A reference cycle keeps KV buffers alive until Python GC runs, which matters for long-running servers.
 - `attnres` at L>1 is not FP32-tested.
 - Multi-turn KV reuse for agent-style serving is still WIP and not in this repo.
