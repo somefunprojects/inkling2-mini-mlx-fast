@@ -358,6 +358,12 @@ class FastDecoder:
         self.ds_dedup_mxfp8 = os.environ.get("INKLING_DS_DEDUP_MXFP8", "0") == "1"
         self.ds_dedup_down = os.environ.get("INKLING_DS_DEDUP_DOWN", "0") == "1"
         self.ds_route_tokenwise = os.environ.get("INKLING_DS_ROUTE_TOKENWISE", "0") == "1"
+        # L>1 verify speedups (INKLING_SPECFAST=all or a comma list). They change
+        # only the verify (L>1) graph; the L=1 decode step is untouched. NONBITWISE-OK class.
+        sf = {t for t in os.environ.get("INKLING_SPECFAST", "").split(",") if t}
+        if "all" in sf:
+            sf |= {"prefix", "fuse", "head", "mask", "moe", "sdpa", "post", "pre", "dattn", "kvsc"}
+        self.sf = sf
         self._prepare()
 
     # ------------------------------------------------------------ prepare
@@ -417,6 +423,10 @@ class FastDecoder:
         self._head_m1 = head_kernel and lm.config.hidden_size % 128 == 0
         if not head_kernel:
             arrays += self._head_cache_arrays()
+        if "sdpa" in self.sf:  # specfast-attn: rel_proj^T for the L-row SDPA kernel
+            from . import spec_attn as sa
+
+            arrays += sa.prepare(model)
         mx.eval(arrays)
 
     def _head_cache_arrays(self):
@@ -603,9 +613,14 @@ class FastDecoder:
             L = x.shape[1]
             ctx = mx.concatenate([state, x.astype(mx.float32)], axis=1)
             w = state.shape[1]
-            self._prefixes[-1][module.conv_idx] = mx.stack(
-                [ctx[:, j + 1 : j + 1 + w] for j in range(L)], axis=1
-            )
+            if "prefix" in self.sf:
+                # INKLING_SPECFAST=prefix: keep ctx [B, w+L, C]; the commit gathers rows
+                # accepted+1 .. accepted+w (same values as the stacked prefixes).
+                self._prefixes[-1][module.conv_idx] = ("ctx", ctx, w)
+            else:
+                self._prefixes[-1][module.conv_idx] = mx.stack(
+                    [ctx[:, j + 1 : j + 1 + w] for j in range(L)], axis=1
+                )
         return out
 
     def _attention(self, attn, x, key_input, value_input, conv, kb, vb, st, tau, dep=None):
@@ -614,10 +629,13 @@ class FastDecoder:
         cfg = self.cfg
         fused = (
             attn.__dict__.get("_fast_fused")
-            if (self.k_fuse and b * length == 1)
+            if (self.k_fuse and (b * length == 1
+                                 or ("fuse" in self.sf and self._prefixes is not None
+                                     and b * length <= 8)))
             else None
         )
         same_kv_input = key_input is None and value_input is None
+        kvsc = False
         key_input = x if key_input is None else key_input
         value_input = x if value_input is None else value_input
         if fused and "kv" in fused and same_kv_input:
@@ -640,6 +658,8 @@ class FastDecoder:
             k, v, conv[ki], conv[vi] = mk.sconv_pair(
                 attn.k_sconv, attn.v_sconv, k, v, conv[ki], conv[vi]
             )
+        elif attn.is_sliding and self._sa_kvsc_ok(attn, x, conv, b):
+            kvsc = True  # INKLING_SPECFAST=kvsc: sconv inside the clip kernel below
         elif attn.is_sliding:
             k = self._sconv(attn.k_sconv, k, conv)
             v = self._sconv(attn.v_sconv, v, conv)
@@ -690,6 +710,17 @@ class FastDecoder:
                 dep=dep if kvip else None,
             )
             sinks = qsm_mask  # marks the sink as already folded into the mask
+        elif kvsc:
+            # INKLING_SPECFAST=kvsc (specfast-attn): k/v ShortConvolutions + the qkv clip in
+            # one launch; the kernel also writes the k/v rollback contexts.
+            from . import spec_attn as sa
+
+            ki, vi = attn.k_sconv.conv_idx, attn.v_sconv.conv_idx
+            q, k, v, r, kctx, vctx = sa.kvsc_clip(
+                q, k, v, r, attn, cfg, attn.k_sconv, attn.v_sconv, conv[ki], conv[vi])
+            w = attn.k_sconv.kernel_size - 1
+            self._prefixes[-1][ki] = ("ctx", kctx, w)
+            self._prefixes[-1][vi] = ("ctx", vctx, w)
         elif self.qkvclip and fk.qkv_clip_supported(attn, cfg, x):
             # INKLING_FAST=qkvclip: the clips, the value norm and the tau
             # scaling in one kernel (bitwise).
@@ -750,6 +781,21 @@ class FastDecoder:
         scale = attn.head_dim**-0.5
         decode = length == 1
         gather = attn.is_sliding and self.cap > self._slice_cap
+        if not decode and "sdpa" in self.sf and self._prefixes is not None:
+            from . import spec_attn as sa
+
+            if sa.sdpa_supported(attn, q_rows, kb, r, sinks):
+                # INKLING_SPECFAST=sdpa (specfast-attn): rel-bias mask + SDPA + sink + output
+                # gate for the L verify rows in one launch (spec_attn.sdpa_rows).
+                if gate is None:
+                    gate = attn.gate_proj(x)
+                out = sa.sdpa_rows(attn, q_rows, kb, vb, r, slot_pos if attn.is_sliding else None,
+                                   qp, sinks, gate if fk.enabled("glue") else None,
+                                   self.ring, scale, self.cap)
+                if not fk.enabled("glue"):
+                    out = (out.astype(mx.float32)
+                           * mx.sigmoid(gate.astype(mx.float32))).astype(x.dtype)
+                return attn.o_proj(out), kb, vb
         if (
             decode and self.exact and self.mega_sdpa and b == 1
             and qsm_mask is not None and (kvz or gather)
@@ -787,6 +833,12 @@ class FastDecoder:
                 mask = fk.slot_mask(
                     r, proj, slot_pos, qp[:, 0], attn.sliding, sinks=sinks
                 )
+            elif "mask" in self.sf and fk._on_gpu():
+                # INKLING_SPECFAST=mask: L-row mask kernel (serial FP32 dot per row, as the
+                # decode mask kernel) with the sink column; one launch.
+                from . import spec_kernels as sk
+
+                mask = sk.slot_mask_rows(r, proj, slot_pos, qp, attn.sliding, sinks, x.dtype)
             else:
                 # Sink logits are per query, so L>1 keeps the zero K/V slot.
                 mask = _rel_slot_mask(
@@ -899,6 +951,14 @@ class FastDecoder:
         return k_ext, v_ext, kb, vb, mask
 
     def _attn_res(self, module, blocks, bkeys, partial):
+        if ("dattn" in self.sf and self._prefixes is not None and self.reuse_keys
+                and partial.ndim == 3 and partial.shape[1] > 1):
+            from . import spec_attn as sa
+
+            if sa.tail_supported(None, None, partial, len(bkeys), module.query):
+                # INKLING_SPECFAST=dattn (specfast-attn): depth attention for the verify
+                # rows (1 or NQ queries) in one launch.
+                return sa.tail_rows(2, None, None, partial, None, list(bkeys), module.query)["hid"]
         if (
             self.attnres
             and self.reuse_keys
@@ -943,6 +1003,14 @@ class FastDecoder:
     def _moe(self, moe, x):
         if x.shape[1] == 1:
             return moe(x)
+        if ("moe" in self.sf and fk.enabled("route") and fk.enabled("fusemoe")
+                and fk.enabled("glue")):
+            # INKLING_SPECFAST=moe: decode-row arithmetic on an expert grid (spec_moe.py).
+            from . import spec_moe
+
+            out = spec_moe.moe_verify(moe, x, moe.fast_prepare())
+            if out is not None:
+                return out
         if not self._moe_dedup_ok(moe):
             if (self.ds_dedup_mxfp8 and moe.sharding_group is None and fk._on_gpu()
                     and x.dtype in (mx.bfloat16, mx.float16, mx.float32)):
@@ -1092,10 +1160,12 @@ class FastDecoder:
                 dep=conv[layer.mlp_sconv.conv_idx],
             )
         stail = self.stail and self._prefixes is None and self._stail_ok(attn)
+        spost = self._sa_post_ok(layer, conv, attn, x, bkeys)
         ac = layer.attn_sconv
         boundary = layer.is_block_boundary
         post = (
             stail
+            and not spost
             and self.mega_post
             and self.attnres
             and self.reuse_keys
@@ -1106,7 +1176,24 @@ class FastDecoder:
             )
         )
         hn = None
-        if post:
+        if spost:
+            # INKLING_SPECFAST=post (specfast-attn): attn sconv + residual (+ boundary key)
+            # + mlp_input depth attention (+ norm) per verify row in one launch.
+            from . import spec_attn as sa
+
+            ac, pn = layer.attn_sconv, layer.post_attention_layernorm
+            use_norm = messages is None and sa.norm_ok(pn)
+            r = sa.tail_rows(0, ac, conv[ac.conv_idx], attn, x, list(bkeys),
+                             layer.mlp_input.query, boundary=boundary,
+                             norm=pn if use_norm else None, want_hid=not use_norm)
+            self._prefixes[-1][ac.conv_idx] = ("ctx", r["ctx"], ac.kernel_size - 1)
+            residual = r["res"]
+            if boundary:
+                blocks.append(x)
+                bkeys.append(r["bkey"])
+            hidden = r["hid"][..., 0, :] if not use_norm else None
+            hn = r.get("hn")
+        elif post:
             # INKLING_FAST=mega_post: attn sconv tail, boundary key, mlp_input
             # depth attention and (no controller) the post-attention norm in
             # one kernel (bitwise).
@@ -1134,15 +1221,15 @@ class FastDecoder:
             )
         else:
             residual = self._sconv(layer.attn_sconv, attn, conv).astype(mx.float32)
-        if layer.is_block_boundary and not post:
+        if layer.is_block_boundary and not (post or spost):
             blocks.append(x)
             if self.reuse_keys:
                 bkeys.append(
                     mx.fast.rms_norm(x.astype(mx.float32)[..., None, :], None, 1e-6)
                 )
-        elif not stail:
+        elif not (stail or spost):
             residual = residual + x.astype(mx.float32)
-        if not post:
+        if not (post or spost):
             hidden = self._attn_res(layer.mlp_input, blocks, bkeys, residual)[..., 0, :]
         if messages is not None:
             mc = layer.controllers["mlp"]
@@ -1195,6 +1282,9 @@ class FastDecoder:
             )
             return out, kb, vb
         hidden = self._moe(layer.mlp, hn)
+        spre = self._sa_pre(layer, conv, hidden, residual, bkeys, x)
+        if spre is not None:
+            return spre, kb, vb
         out = (
             residual + self._sconv(layer.mlp_sconv, hidden, conv).astype(mx.float32)
         ).astype(x.dtype)
@@ -1233,6 +1323,50 @@ class FastDecoder:
             and messages.shape[-2] >= 4
             and mk.ctrl_supported(x, dw, fw, gw, n_ctrl)
         )
+
+    def _sa_kvsc_ok(self, attn, x, conv, b):
+        if "kvsc" not in self.sf or self._prefixes is None or not self.qkvclip:
+            return False
+        from . import spec_attn as sa
+
+        ks, vs = attn.k_sconv, attn.v_sconv
+        return sa.kvsc_supported(attn, self.cfg, x, ks, vs, conv[ks.conv_idx],
+                                 conv[vs.conv_idx], b)
+
+    def _sa_post_ok(self, layer, conv, attn, x, bkeys):
+        if "post" not in self.sf or self._prefixes is None or not self.reuse_keys:
+            return False
+        from . import spec_attn as sa
+
+        ac, q = layer.attn_sconv, layer.mlp_input.query
+        nk = len(bkeys) + (1 if layer.is_block_boundary else 0)
+        return (q.ndim == 1 and x.dtype == attn.dtype
+                and sa.tail_supported(ac, conv[ac.conv_idx], attn, nk, q))
+
+    def _sa_pre(self, layer, conv, hidden, residual, bkeys, x):
+        """INKLING_SPECFAST=pre (specfast-attn): mlp sconv + residual, then the next visit's
+        attention_input depth attention (+ its input norm) per verify row in one launch;
+        hands the result over like mega_pre (self._pre). None when not applicable."""
+        if ("pre" not in self.sf or self._prefixes is None or not self.reuse_keys
+                or self._next is None or residual.dtype != mx.float32
+                or hidden.dtype != x.dtype):
+            return None
+        from . import spec_attn as sa
+
+        nl, nmsg = self._next
+        ai = nl.attention_input
+        mc = layer.mlp_sconv
+        if ai is None or not sa.tail_supported(
+                mc, conv[mc.conv_idx], hidden, len(bkeys), ai.query):
+            return None
+        nn_ = (nl.input_layernorm if (nl.is_sliding and not nmsg and ai.query.ndim == 1)
+               else None)
+        use_norm = nn_ is not None and sa.norm_ok(nn_)
+        r = sa.tail_rows(1, mc, conv[mc.conv_idx], hidden, residual, list(bkeys), ai.query,
+                         norm=nn_ if use_norm else None, want_hid=True, out_dtype=x.dtype)
+        self._prefixes[-1][mc.conv_idx] = ("ctx", r["ctx"], mc.kernel_size - 1)
+        self._pre = (nl, r["hid"], r.get("hn"))
+        return r["res"]
 
     def _stail_ok(self, a):
         # Same conditions as ShortConvolution's kernel path (else stock runs
@@ -1326,7 +1460,20 @@ class FastDecoder:
         h = self._attn_res(model.final_input, blocks, bkeys, x)[..., 0, :]
         if len(self.visits) in want:
             caps[len(self.visits)] = model.norm(h).astype(x.dtype)
-        logits = self.lm._logits_from_norm(model.norm(h))
+        if ("head" in self.sf and self._prefixes is not None and L > 1
+                and h.shape[0] * L <= 15 and fk._on_gpu()
+                and type(self.lm.lm_head).__name__ == "Linear" and self.lm.sharding_group is None
+                and self.lm.lm_head.weight.dtype == mx.bfloat16):
+            # INKLING_SPECFAST=head: multi-row BF16-weight / FP32-accumulate head GEMV
+            # (fast_kernels.lm_head_gemv, the head_approx kernel; ordering-only vs the
+            # cached-FP32 GEMM; the BF16->FP32 widening is exact). Verify rows only.
+            hn = model.norm(h)
+            hn = hn.astype(model.embed_norm.weight.dtype).astype(mx.float32)
+            c = self.lm.config
+            logits = fk.lm_head_gemv(hn, self.lm.lm_head.weight, c.unpadded_vocab_size,
+                                     c.final_logit_softcapping or 0.0)
+        else:
+            logits = self.lm._logits_from_norm(model.norm(h))
         new = {
             "q_pos": q_pos,
             "swa_pos": st["swa_pos_new"],
@@ -1343,6 +1490,15 @@ class FastDecoder:
         new["q_pos"] = new["q_pos"] + 1
         nxt = mx.argmax(logits, axis=-1).astype(mx.int32)
         return (logits, nxt, *self._flatten(new))
+
+    def _step_cap_flat(self, captures, tokens, *flat):
+        """_step_flat plus the drafter captures (extra outputs only; same math)."""
+        self._prefixes = None
+        logits, new, caps = self._forward(tokens, self._unflatten(list(flat)), captures)
+        logits = logits[:, -1]
+        new["q_pos"] = new["q_pos"] + 1
+        nxt = mx.argmax(logits, axis=-1).astype(mx.int32)
+        return (logits, nxt, *caps, *self._flatten(new))
 
     def _spec_flat(self, captures, tokens, *flat):
         """Greedy verify of tokens = [anchor, d_1..d_n] plus on-device accept
@@ -1372,13 +1528,19 @@ class FastDecoder:
         )
         new["q_pos"] = new["q_pos"] + accepted + 1
         sel = accepted[:, None, None, None]
-        new["conv"] = [
-            [
-                mx.take_along_axis(pv, mx.broadcast_to(sel, (B, 1, *pv.shape[2:])), axis=1)[:, 0]
-                for pv in prefixes[visit]
-            ]
-            for visit in range(len(self.visits))
-        ]
+        gidx = {}
+
+        def commit(pv):
+            if isinstance(pv, tuple):  # INKLING_SPECFAST=prefix
+                _, ctx, w = pv
+                gi = gidx.get(w)
+                if gi is None:
+                    gi = gidx[w] = (accepted[:, None] + 1
+                                    + mx.arange(w, dtype=mx.int32)[None])[:, :, None]
+                return mx.take_along_axis(ctx, mx.broadcast_to(gi, (B, w, ctx.shape[-1])), axis=1)
+            return mx.take_along_axis(pv, mx.broadcast_to(sel, (B, 1, *pv.shape[2:])), axis=1)[:, 0]
+
+        new["conv"] = [[commit(pv) for pv in prefixes[visit]] for visit in range(len(self.visits))]
         return (logits, target, accepted, emitted, bonus, *caps, *self._flatten(new))
 
     # ------------------------------------------------------------- public
@@ -1409,6 +1571,33 @@ class FastDecoder:
         self.state = self._unflatten(list(out[2:]))
         self._known = [k + 1 for k in self._known]
         return logits, nxt
+
+    def step_captures(self, tokens, captures):
+        """step() that also returns the drafter captures ([B, 1, D] each), for adaptive
+        speculation (plain decode steps while the drafter keeps its context). A separate
+        compiled function: step() itself is unchanged. Returns (logits, argmax, caps)."""
+        tokens = tokens.astype(mx.int32)
+        captures = tuple(captures)
+        if self.fallback is None:
+            self._fit_bounded(1)
+        if self.fallback is not None:
+            raise Unsupported("step_captures: static state handed off to stock")
+        if self.pos + 1 > self.cap:
+            self._grow(self.pos + 1)  # Unsupported past the largest bucket
+        self._ensure_head_cache(tokens.shape[0])
+        key = ("step",) + captures
+        fn = self._spec_compiled.get(key)
+        if fn is None:
+            fn = self._spec_compiled[key] = mx.compile(
+                lambda *a: self._step_cap_flat(captures, *a))
+        out = fn(tokens, *self._flatten(self.state))
+        self._kvip_pending = self._kvip_pending or self.mega_kvip
+        nc = len(captures)
+        logits, nxt = out[0], out[1]
+        caps = list(out[2: 2 + nc])
+        self.state = self._unflatten(list(out[2 + nc:]))
+        self._known = [k + 1 for k in self._known]
+        return logits, nxt, caps
 
     def spec_step(self, tokens, captures=(), compiled=True):
         """One greedy speculative round: verify tokens [B, L] = [anchor,
