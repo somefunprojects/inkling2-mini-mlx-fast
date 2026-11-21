@@ -11,7 +11,7 @@ Here is what we measured on our own Mac (Apple M5 Ultra, 64-core GPU, 96 GB unif
 | Plain (`main`) | 512 | Off | 37.3 (stock) | 75.6 (2.03x) | Yes |
 | Plain (`main`) | 4K | Off | 35.4 (stock) | 73.5 (2.08x) | Yes |
 | Speculative (`specfast`) | <=4K | On | 78.2 / 76.3 (plain) | 102.7 mean (1.31x) | No, within noise bar |
-| Batched, B=4/8/16 (`batch`) | 512 | Off | 155.2 / 234.9 / 303.0 (our plain path; stock: 111.1 / 175.6 / 249.7) | 208.6 / 287.8 / 344.5 | No, within noise bar |
+| Batched, B=4/8/16 (`batch`), aggregate tok/s, distinct prompts | 512 | Off | 153.7 / 232.6 / 301.6 (our plain path; stock: 111.1 / 175.6 / 249.7) | 222.2 / 321.8 / 420.1 | No, within noise bar (up to 4K context) |
 
 "Bit-exact" means every decoding step produces identical logits to unmodified `mlx-vlm`; the speculative and batched modes reorder some math and allow tiny differences that stay within stock `mlx-vlm`'s own run-to-run noise. This project is a work in progress, and corrections or bug reports are always welcome. See [DETAILS.md](DETAILS.md) for long-context runs, prefill timings, correctness gates, known limits, and all runtime flags.
 
