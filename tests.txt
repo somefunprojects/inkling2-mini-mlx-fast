@@ -1,0 +1,6 @@
+# name|environment|script and args   ($ALL31 = the full INKLING_FAST flag list, see run_tests.sh)
+mega_fd_wide|INKLING_FAST=$ALL31 INKLING_FAST_DECODE=1 TINY_WIDE=1 MEGA_ATTRS=mega_attnres,mega_post,mega_pre,mega_qsm,mega_oproj,mega_kvz,mega_kvip,mega_sdpa MEGA_FLAGS=mega_rg2,mega_dpar,mega_qsm2,mega_oproj2 T0S=5,40,127,128,240,1000,1023,1025,1100,2100,4100,8180|tests_fast/test_mega_fd.py
+mega_fd_real|INKLING_FAST=$ALL31 INKLING_FAST_DECODE=1 TINY_REAL=1|tests_fast/test_mega_fd.py
+kvip_hazard|INKLING_FAST=$ALL31 INKLING_FAST_DECODE=1 TINY_REAL=1 T0S=5,1000 REPS=2|tests_fast/test_kvip_hazard.py
+spec_verify_fp32|INKLING_FAST=$ALL31 INKLING_FAST_DECODE=1 INKLING_FAST_VERIFY=1 MLX_ENABLE_TF32=0|tests_fast/test_spec.py --batches 1
+sdpa_unit|INKLING_FAST=$ALL31 INKLING_FAST_DECODE=1|tests_fast/test_sdpa.py
