@@ -292,7 +292,7 @@ class FastDecoder:
         # loads issued ahead (mega_kernels.sdpa_exact). Needs mega_qsm.
         self.mega_sdpa = fk.enabled("mega_sdpa") and fk._on_gpu() and use_kernels
         if self.mega_sdpa:
-            # REVIEW_SDPA S1 (integ): replica vs mx.fast once per process.
+            # replica vs mx.fast once per process.
             c = self.cfg
             dims = {(c.num_attention_heads, c.num_key_value_heads, c.head_dim),
                     (c.swa_num_attention_heads, c.swa_num_key_value_heads,
@@ -522,7 +522,7 @@ class FastDecoder:
         return self
 
     def _settle_kvip(self):
-        """REVIEW_MEGA2 F1: mega_kvip writes KV rows in place, so the state's
+        """mega_kvip writes KV rows in place, so the state's
         k/v arrays do not depend (in MLX's graph) on the qsm kernels that
         wrote them.  Before anything outside a qsm step reads or copies the
         buffers (bucket growth, to_cache, a verify round), run the pending

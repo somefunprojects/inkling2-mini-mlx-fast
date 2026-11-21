@@ -1,7 +1,7 @@
 # Copyright (c) 2026 somefunprojects. MIT License (see LICENSE).
 """INKLING_SPECFAST=moe: speculative-verify MoE (B*L rows, L in 2..8) for NVFP4 experts.
 
-Decode-row arithmetic, expert-grid execution (specfast-moe, 2026-11-21):
+Decode-row arithmetic, expert-grid execution (specfast-moe):
   1. router_rows: mega_kernels' router GEMV (MLX gemv order at M=1) per row, row on grid y
      (no TF32 router GEMM at M>1).
   2. fast_kernels.route_topk on the R x E logits (row-independent; == decode per row).

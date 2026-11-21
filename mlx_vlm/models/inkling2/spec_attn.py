@@ -1,5 +1,5 @@
 # Copyright (c) 2026 somefunprojects. MIT License (see LICENSE).
-"""specfast-attn (2026-11-21): attention-side kernels for the L>1 verify step (B=1).
+"""specfast-attn: attention-side kernels for the L>1 verify step (B=1).
 
 INKLING_SPECFAST tokens (FastDecoder.sf), active only in verify (``_prefixes is not None``):
   sdpa  one launch per visit for rel-bias mask + SDPA + sink + output gate (no [H, L, S+1]

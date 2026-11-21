@@ -1,4 +1,4 @@
-"""megafix: gate and layout checks for mega_ctrl / mega_norm (REVIEW_MEGA L1, L2, L4).
+"""megafix: gate and layout checks for mega_ctrl / mega_norm.
 - L1: ctrl_supported refuses non-BF16 or mis-shaped forget/gain weights; accepts the real layouts
   (3 stacked controllers [3,R,2D]/[3,D,R], one mlp controller [R,2D]/[D,R]).
 - L2: rms_norm_cast reads a strided weight view correctly (bitwise vs RMSNorm with that view);

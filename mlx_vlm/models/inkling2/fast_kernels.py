@@ -55,7 +55,7 @@ _REPLICA_OK = None
 
 
 def replica_ok():
-    """REVIEW_SDPA S1 (integ): every ``mega_*`` kernel (mega_sdpa included)
+    """every ``mega_*`` kernel (mega_sdpa included)
     replicates MLX 0.32.4 reduction orders and kernel selection, so they run
     only on the exact verified MLX version and GPU arch; otherwise
     ``enabled("mega_*")`` is False and the stock/base paths run.  Unlike the
@@ -80,7 +80,7 @@ def replica_ok():
 # gemv_reduction_matches_fused, SDPA 1-pass/2-pass thresholds in
 # fast_decode._sdpa_cap_limits) verified only on this MLX and GPU family.
 EXACT_MLX_VERSIONS = ("0.32.4",)
-EXACT_GPU_ARCHS = ("applegpu_g17d",)  # M5 Ultra (Mac Studio)
+EXACT_GPU_ARCHS = ("applegpu_g17d",)  # M5 Ultra
 
 
 def check_exact_runtime(what="INKLING_FAST"):
@@ -1445,7 +1445,7 @@ _RGATHER2_SRC = r"""
     const size_t o = (((size_t)b * NKV + h) * (WINDOW + 1) + t) * D;
     if (which == 0) {
         const device T* src = kb + b * kb_strides[0] + h * kb_strides[1] + slot * kb_strides[2];
-        // REVIEW_MEGAPERF P3: the uint2 path needs 8-byte aligned rows (base
+        // the uint2 path needs 8-byte aligned rows (base
         // pointer incl. the array offset, and every outer stride % 4 == 0);
         // anything else takes the scalar path (same values).
         if (kb_strides[3] == 1 && (kb_strides[0] % 4) == 0 && (kb_strides[1] % 4) == 0
@@ -1456,7 +1456,7 @@ _RGATHER2_SRC = r"""
         }
     } else {
         const device T* src = vb + b * vb_strides[0] + h * vb_strides[1] + slot * vb_strides[2];
-        // REVIEW_MEGAPERF P3: the uint2 path needs 8-byte aligned rows (base
+        // the uint2 path needs 8-byte aligned rows (base
         // pointer incl. the array offset, and every outer stride % 4 == 0);
         // anything else takes the scalar path (same values).
         if (vb_strides[3] == 1 && (vb_strides[0] % 4) == 0 && (vb_strides[1] % 4) == 0
@@ -1720,9 +1720,8 @@ def attn_res_supported(partial, query, n_keys):
     Stock ``keys @ q.T`` collapses its batch into M = rows * (n_keys + 1)
     gemv rows (matmul.cpp "Collapse batches into M") and keeps that variant
     only while K >= 16 * M (gemv_axbpy); above it MLX switches to bm4/sn32,
-    a different K order, so the kernel would no longer be bitwise (REVIEW_MEGA
-    M1).  Uncollapsed batches use M = n_keys + 1, so the collapsed bound is
-    the conservative one."""
+    a different K order, so the kernel would no longer be bitwise.  Uncollapsed batches use
+    M = n_keys + 1, so the collapsed bound is the conservative one."""
     D = partial.shape[-1]
     rows = partial.size // D
     return (
@@ -1734,7 +1733,7 @@ def attn_res_supported(partial, query, n_keys):
         and 1 <= n_keys + 1 <= 32
         # Metal has 31 buffer slots: 2 per key + partial(3) + query(2) +
         # scale + out = 2 * n_keys + 7 (n_keys <= 12, N <= 13); past it the
-        # library fails to build (megafix, found by the N sweep; REVIEW_MEGA L3)
+        # library fails to build (megafix, found by the N sweep)
         and 2 * n_keys + 7 <= 31
         and rows <= 16
         and D >= 16 * rows * (n_keys + 1)
