@@ -178,6 +178,7 @@ inline void spec_build_lut(threadgroup float2* lut, uint tid, uint nthreads) {
 // the compiler makes the same FMA-contraction choices as for stock qdot.
 inline float spec_qdot_d(const thread float* x, const thread float* d, float scale, int nv) {
   float accum = 0;
+#pragma unroll
   for (int i = 0; i < (nv / 4); i++)
     accum += (x[4 * i] * d[4 * i] + x[4 * i + 1] * d[4 * i + 1] + x[4 * i + 2] * d[4 * i + 2] +
               x[4 * i + 3] * d[4 * i + 3]);
@@ -193,17 +194,17 @@ inline float spec_qdot_d(const thread float* x, const thread float* d, float sca
 // 8 consecutive input values -> float (exact widening). 16-byte vector loads for
 // bf16 / f32 device inputs; plain loads otherwise (e.g. small inputs MLX binds as constant).
 template <typename XP>
-inline void spec_load8(XP p, thread float* o) {
+__attribute__((always_inline)) inline void spec_load8(XP p, thread float* o) {
   for (int i = 0; i < 8; i++) o[i] = static_cast<float>(p[i]);
 }
-inline void spec_load8(const device bfloat16_t* p, thread float* o) {
+__attribute__((always_inline)) inline void spec_load8(const device bfloat16_t* p, thread float* o) {
   const uint4 u = *(const device uint4*)p;
   o[0] = as_type<float>(u.x << 16); o[1] = as_type<float>(u.x & 0xFFFF0000u);
   o[2] = as_type<float>(u.y << 16); o[3] = as_type<float>(u.y & 0xFFFF0000u);
   o[4] = as_type<float>(u.z << 16); o[5] = as_type<float>(u.z & 0xFFFF0000u);
   o[6] = as_type<float>(u.w << 16); o[7] = as_type<float>(u.w & 0xFFFF0000u);
 }
-inline void spec_load8(const device float* p, thread float* o) {
+__attribute__((always_inline)) inline void spec_load8(const device float* p, thread float* o) {
   const float4 a = *(const device float4*)p, b = *(const device float4*)(p + 4);
   o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w; o[4] = b.x; o[5] = b.y; o[6] = b.z; o[7] = b.w;
 }
@@ -214,7 +215,7 @@ inline void spec_load8(const device float* p, thread float* o) {
 #define SPEC_XV 1
 #endif
 template <int PPT>
-inline void spec_deq(const thread uint32_t* wv, thread float* d, const threadgroup float2* lut) {
+__attribute__((always_inline)) inline void spec_deq(const thread uint32_t* wv, thread float* d, const threadgroup float2* lut) {
 #pragma unroll
   for (int j = 0; j < PPT; j++) {
     if (SPEC_LUT) {
@@ -458,6 +459,64 @@ _META_SRC = r"""
 """
 
 
+# meta2: like _META_SRC, but each distinct expert's routes are split into chunks of TV (ascending route
+# order), one chunk per slot: meta2[z] = {e, nv, p0..p_{TV-1}}; slots beyond the chunk count get e = -1.
+# Experts in ascending id, chunks of one expert adjacent (they run concurrently and share weight reads).
+# Every token still sees one pass over its expert (the per-row arithmetic does not depend on chunking).
+_META2_SRC = r"""
+    constexpr int NW = (E + 31) / 32;
+    threadgroup uint sidx[P];
+    threadgroup uint smask[NW];
+    threadgroup int scnt[P];
+    const int t = (int)thread_position_in_threadgroup.x;
+    if (t < P) sidx[t] = idx[t];
+    if (t < NW) smask[t] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < P) atomic_fetch_or_explicit((threadgroup atomic_uint*)&smask[sidx[t] >> 5], 1u << (sidx[t] & 31u),
+                                        memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int e = -1, cnt = 0;
+    if (t < P) {
+        for (int w = 0; w < NW && e < 0; w++) {
+            const uint m = smask[w];
+            const int c = (int)popcount(m);
+            if (t < cnt + c) {
+                uint mm = m;
+                for (int j = 0; j < t - cnt; j++) mm &= mm - 1u;
+                e = w * 32 + (int)ctz(mm);
+            }
+            cnt += c;
+        }
+    }
+    int n = 0;
+    if (e >= 0)
+        for (int p = 0; p < P; p++) n += ((int)sidx[p] == e) ? 1 : 0;
+    const int nch = (n + TV - 1) / TV;
+    if (t < P) scnt[t] = nch;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t >= P) return;
+    int base = 0;
+    for (int j = 0; j < t; j++) base += scnt[j];
+    int total = base;
+    for (int j = t; j < P; j++) total += scnt[j];
+    // slots [total, P): empty
+    for (int z = total + t; z < P; z += P) meta[z * (2 + TV)] = -1;
+    if (e < 0) return;
+    int k = 0, ch = 0;
+    for (int p = 0; p < P; p++) {
+        if ((int)sidx[p] == e) {
+            device int* out = meta + (base + ch) * (2 + TV);
+            out[2 + k] = p;
+            k++;
+            if (k == TV) { out[0] = e; out[1] = TV; k = 0; ch++; }
+        }
+    }
+    if (k > 0) {
+        device int* out = meta + (base + ch) * (2 + TV);
+        out[0] = e; out[1] = k;
+    }
+"""
+
 _PROBE_SRC = r"""
     threadgroup int plist[RMAX];
     const int lane = (int)thread_index_in_simdgroup;
@@ -479,6 +538,389 @@ _ROUTER_ROWS_PRE = r"""
     logits += (size_t)threadgroup_position_in_grid.y * E;
 """
 
+# ---------------------------------------------------------------------------------------------
+# v2: one pass over each expert's weights for ALL its routed tokens.
+# At M = 4..16 rows the TV=1 kernels above re-dequantize every weight word once per routed token
+# (n passes); with ~128 routes/layer that is instruction-issue bound (~35 SG-instructions per
+# (row, token, 8-value block)). Here each lane dequantizes its words once per block (fp4 byte LUT
+# + an fp8 scale LUT built with q_dequantize_scale's own conversion) and applies them to up to TVM
+# tokens whose accumulators stay in registers; the per-(token, row) arithmetic is unchanged
+# (spec_qdot_d at stock's function boundary, same lane partition, same block order, simd_sum),
+# so every row stays bitwise equal to the L=1 decode path. Epilogues are spread over lanes.
+_V2_FN = r"""
+#ifndef SPEC_PF
+#define SPEC_PF 1
+#endif
+#ifndef SPEC_HD
+#define SPEC_HD 1
+#endif
+#if SPEC_HD
+typedef half2 spec_lut_t;   // fp4 values are exact in half; x * float(d) == x * d_f32
+typedef half spec_d_t;
+#else
+typedef float2 spec_lut_t;
+typedef float spec_d_t;
+#endif
+inline void spec_build_luts(threadgroup spec_lut_t* lut, threadgroup float* slut, uint tid, uint nthreads) {
+  for (uint b = tid; b < 256; b += nthreads) {
+    lut[b] = spec_lut_t(QDequantize<4>{}((uint8_t)(b & 15u)), QDequantize<4>{}((uint8_t)(b >> 4)));
+    slut[b] = q_dequantize_scale<float, 16>((uint8_t)b);
+  }
+}
+#ifndef SPEC_ALU
+#define SPEC_ALU 0
+#endif
+template <int PPT>
+__attribute__((always_inline)) inline void spec_deq2(const thread uint32_t* wv, thread spec_d_t* d,
+                                                     const threadgroup spec_lut_t* lut) {
+#pragma unroll
+  for (int j = 0; j < PPT; j++)
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+#if SPEC_ALU && SPEC_HD
+      // qfp4_e2m1 for both nibbles of byte q at once: as_type<half>((b & 7) << 9) * 16384, sign from bit 3
+      // (sign applied to the bit pattern: -0.0 for b == 8, as MLX's `bits & 8 ? -converted : converted`).
+      const uint b = (wv[j] >> (8 * q)) & 255u;
+      const uint u = ((b & 7u) << 9) | (((b >> 4) & 7u) << 25) | ((b & 8u) << 12) | ((b & 128u) << 24);
+      const half2 dq = as_type<half2>(u) * half2(16384.0h, 16384.0h);
+#else
+      const spec_lut_t dq = lut[(wv[j] >> (8 * q)) & 255u];
+#endif
+      d[8 * j + 2 * q] = dq.x;
+      d[8 * j + 2 * q + 1] = dq.y;
+    }
+}
+// spec_qdot_d with the dequantized values held as spec_d_t (widened exactly at use).
+inline float spec_qdot_h(const thread float* x, const thread spec_d_t* d, float scale, int nv) {
+  float accum = 0;
+#pragma unroll
+  for (int i = 0; i < (nv / 4); i++)
+    accum += (x[4 * i] * static_cast<float>(d[4 * i]) + x[4 * i + 1] * static_cast<float>(d[4 * i + 1]) +
+              x[4 * i + 2] * static_cast<float>(d[4 * i + 2]) + x[4 * i + 3] * static_cast<float>(d[4 * i + 3]));
+  return scale * accum;
+}
+// NR weight rows (offsets roff) x up to TVM tokens (x rows at xoff[v], v < nv) in one pass.
+// result[v * NR + r] += lane partials, in stock fp_qmv[_fast]_impl order.
+template <typename T, int K, int GS, int NR, int TVM, bool FAST, typename WP, typename SP, typename XP>
+__attribute__((always_inline)) inline void qmv_multi(
+    WP wbase, SP sbase, const thread int* roff, const thread int* xoff, int nv, XP x, int lane,
+    thread float* result, const threadgroup spec_lut_t* lut, const threadgroup float* slut) {
+  constexpr int PF = 8;
+  constexpr int PPT = FAST ? 2 : 1;
+  constexpr int VPT = PF * PPT;
+  constexpr int BLOCK = VPT * 32;
+  constexpr int KW = K / PF;
+  constexpr int KG = K / GS;
+  static_assert(GS == 16, "nvfp4");
+  static_assert(K % 8 == 0, "K % 8");
+  // 32-bit offsets (no per-row / per-token 64-bit pointers held in registers).
+  int wo[NR], so[NR], xo[TVM];
+#pragma unroll
+  for (int r = 0; r < NR; r++) {
+    wo[r] = roff[r] * KW + lane * PPT;
+    so[r] = roff[r] * KG + (lane * VPT) / GS;
+  }
+#pragma unroll
+  for (int v = 0; v < TVM; v++) xo[v] = xoff[v] + lane * VPT;
+  int k = 0;
+#if SPEC_PF
+  // Software pipelining: the next block's weight words and scale bytes are loaded before
+  // this block's math (loads only; the arithmetic is unchanged).
+  // Guarded like the in-loop prefetch: a lane past K (K < BLOCK, e.g. tiny NH=128) would read the next
+  // row, or past the buffer on the last row. Its values are never used.
+  uint32_t wn[NR][PPT];
+  uint sn[NR];
+  const bool first = lane * VPT < K;
+#pragma unroll
+  for (int r = 0; r < NR; r++) {
+#pragma unroll
+    for (int j = 0; j < PPT; j++) wn[r][j] = first ? wbase[wo[r] + j] : 0u;
+    sn[r] = first ? sbase[so[r]] : 0u;
+  }
+#endif
+  for (; FAST ? (k < K) : (k < K - BLOCK); k += BLOCK) {
+    spec_d_t d[NR][VPT];
+    float s[NR];
+#if SPEC_PF
+    const bool more = k + BLOCK + lane * VPT < K;
+#endif
+#pragma unroll
+    for (int r = 0; r < NR; r++) {
+      uint32_t wv[PPT];
+#if SPEC_PF
+#pragma unroll
+      for (int j = 0; j < PPT; j++) wv[j] = wn[r][j];
+      const uint sc = sn[r];
+      wo[r] += BLOCK / PF;
+      so[r] += BLOCK / GS;
+      if (more) {
+#pragma unroll
+        for (int j = 0; j < PPT; j++) wn[r][j] = wbase[wo[r] + j];
+        sn[r] = sbase[so[r]];
+      }
+      spec_deq2<PPT>(wv, d[r], lut);
+      s[r] = slut[sc];
+#else
+#pragma unroll
+      for (int j = 0; j < PPT; j++) wv[j] = wbase[wo[r] + j];
+      spec_deq2<PPT>(wv, d[r], lut);
+      s[r] = slut[sbase[so[r]]];
+      wo[r] += BLOCK / PF;
+      so[r] += BLOCK / GS;
+#endif
+    }
+#pragma unroll
+    for (int v = 0; v < TVM; v++) {
+      if (v < nv) {
+        float xt[VPT];
+#pragma unroll
+        for (int h = 0; h < PPT; h++) spec_load8(x + xo[v] + 8 * h, xt + 8 * h);
+#pragma unroll
+        for (int r = 0; r < NR; r++) result[v * NR + r] += spec_qdot_h(xt, d[r], s[r], VPT);
+      }
+      xo[v] += BLOCK;
+    }
+  }
+  if (!FAST) {
+    // rem = clamp(K - k - lane*8, 0, 8) is 0 or 8: qdot_safe(N = 8) == the full-block expression.
+    if (K - k - lane * VPT > 0) {
+      spec_d_t d[NR][VPT];
+      float s[NR];
+#pragma unroll
+      for (int r = 0; r < NR; r++) {
+#if SPEC_PF
+        uint32_t wv[1] = {wn[r][0]};
+        spec_deq2<1>(wv, d[r], lut);
+        s[r] = slut[sn[r]];
+#else
+        uint32_t wv[1] = {wbase[wo[r]]};
+        spec_deq2<1>(wv, d[r], lut);
+        s[r] = slut[sbase[so[r]]];
+#endif
+      }
+#pragma unroll
+      for (int v = 0; v < TVM; v++) {
+        if (v < nv) {
+          float xt[VPT];
+          spec_load8(x + xo[v], xt);
+#pragma unroll
+          for (int r = 0; r < NR; r++) result[v * NR + r] += spec_qdot_h(xt, d[r], s[r], VPT);
+        }
+      }
+    }
+  }
+}
+"""
+
+_PROLOGUE2 = r"""
+    threadgroup spec_lut_t lut[256];
+    threadgroup float slut[256];
+    const int lane = (int)thread_index_in_simdgroup;
+    const int sg = (int)simdgroup_index_in_threadgroup;
+    if (meta[(int)threadgroup_position_in_grid.z * (2 + RMAX)] < 0) return;  // uniform
+    spec_build_luts(lut, slut, (uint)(sg * 32 + lane), (uint)(SGS * 32));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int zs = (int)threadgroup_position_in_grid.z; zs < P; zs += ZS) {
+    auto mz = meta + zs * (2 + RMAX);
+    const int e = mz[0];
+    if (e < 0) break;
+    const int n = mz[1];
+    auto plist = mz + 2;
+    const int ybeg = (int)threadgroup_position_in_grid.y * RPC;
+    constexpr int KW = K / 8;
+    constexpr int KG = K / GS;
+"""
+
+# act[p, :] = SoftcappedSwiGLU(gate, up) for route p = row * KT + slot; RG gate rows (+ RG up rows)
+# per simdgroup, tokens in chunks of TVM (one weight pass per chunk).
+_GUA2_SRC = _PROLOGUE2 + r"""
+    auto wgb = wg + (size_t)e * WR * KW;
+    auto sgb = sgs + (size_t)e * WR * KG;
+    auto wub = wu + (size_t)e * WR * KW;
+    auto sub = sus + (size_t)e * WR * KG;
+    const float ig = spec_inv_scale<SMG>(gsg, GNG, e);
+    const float iu = spec_inv_scale<SMU>(gsu, GNU, e);
+    const float gc = caps[0], uc = caps[1];
+    for (int row0 = ybeg + sg * RG; row0 < ybeg + RPC; row0 += SGS * RG) {
+    int ro2[2 * RG];
+#pragma unroll
+    for (int r = 0; r < RG; r++) { ro2[r] = row0 + r; ro2[RG + r] = UOFF + row0 + r; }
+    for (int t0 = 0; t0 < n; t0 += TVM) {
+        const int nv = min(n - t0, TVM);
+        int xoff[TVM];
+#pragma unroll
+        for (int v = 0; v < TVM; v++) xoff[v] = v < nv ? (plist[t0 + v] / KT) * K : 0;
+        float res[TVM * 2 * RG];
+        float ru[TVM * RG];
+#pragma unroll
+        for (int i = 0; i < TVM * 2 * RG; i++) res[i] = 0;
+#pragma unroll
+        for (int i = 0; i < TVM * RG; i++) ru[i] = 0;
+        if (SAMEW) {
+            qmv_multi<T, K, GS, 2 * RG, TVM, FAST>(wgb, sgb, ro2, xoff, nv, x, lane, res, lut, slut);
+        } else {
+            qmv_multi<T, K, GS, RG, TVM, FAST>(wgb, sgb, ro2, xoff, nv, x, lane, res, lut, slut);
+            qmv_multi<T, K, GS, RG, TVM, FAST>(wub, sub, ro2 + RG, xoff, nv, x, lane, ru, lut, slut);
+        }
+        // Lane j (< nv*RG) takes output (v, r) = (j / RG, j % RG).
+        float mg = 0, mu = 0;
+#pragma unroll
+        for (int v = 0; v < TVM; v++) {
+            if (v < nv) {
+#pragma unroll
+                for (int r = 0; r < RG; r++) {
+                    const float sgv = simd_sum(SAMEW ? res[v * 2 * RG + r] : res[v * RG + r]);
+                    const float suv = simd_sum(SAMEW ? res[v * 2 * RG + RG + r] : ru[v * RG + r]);
+                    if (lane == v * RG + r) { mg = sgv; mu = suv; }
+                }
+            }
+        }
+        if (lane < nv * RG) {
+            const int v = lane / RG, r = lane % RG;
+            const int p = plist[t0 + v];
+            const float g = static_cast<float>(static_cast<T>(SMG ? mg * ig : mg));
+            const float u = static_cast<float>(static_cast<T>(SMU ? mu * iu : mu));
+            const float yg = 1 / (1 + metal::precise::exp(metal::abs(g)));
+            const float sig = (g < 0) ? yg : 1 - yg;
+            float a = metal::precise::tanh(g / gc) * gc;
+            a = a * sig;
+            a = a * metal::precise::tanh(u / uc);
+            a = a * uc;
+            act[(size_t)p * NOUT + row0 + r] = static_cast<T>(a);
+        }
+    }
+    }
+    }
+"""
+
+# y[p, :] = act[p, :] @ W[e].T for the routes p of each distinct expert; RD rows per simdgroup,
+# tokens in chunks of TVM (one weight pass per chunk); stores spread over lanes.
+_DOWN2_SRC = _PROLOGUE2 + r"""
+    auto wb = w + (size_t)e * NOUT * KW;
+    auto sb = scales + (size_t)e * NOUT * KG;
+    const float inv = spec_inv_scale<SM>(gs, GN, e);
+    for (int row0 = ybeg + sg * RD; row0 < ybeg + RPC; row0 += SGS * RD) {
+    int roff[RD];
+#pragma unroll
+    for (int r = 0; r < RD; r++) roff[r] = row0 + r;
+    for (int t0 = 0; t0 < n; t0 += TVM) {
+        const int nv = min(n - t0, TVM);
+        int xoff[TVM];
+#pragma unroll
+        for (int v = 0; v < TVM; v++) xoff[v] = v < nv ? plist[t0 + v] * K : 0;
+        float res[TVM * RD];
+#pragma unroll
+        for (int i = 0; i < TVM * RD; i++) res[i] = 0;
+        qmv_multi<T, K, GS, RD, TVM, FAST>(wb, sb, roff, xoff, nv, act, lane, res, lut, slut);
+        float mine = 0;
+#pragma unroll
+        for (int v = 0; v < TVM; v++) {
+            if (v < nv) {
+#pragma unroll
+                for (int r = 0; r < RD; r++) {
+                    const float rr = simd_sum(res[v * RD + r]);
+                    if (lane == v * RD + r) mine = rr;
+                }
+            }
+        }
+        if (lane < nv * RD) {
+            const int v = lane / RD, r = lane % RD;
+            y[(size_t)plist[t0 + v] * NOUT + row0 + r] = static_cast<T>(SM ? mine * inv : mine);
+        }
+    }
+    }
+    }
+"""
+
+# route_topk (fast_kernels._ROUTE_SRC, per row unchanged) for all R rows + the meta kernel, one launch:
+# one threadgroup of NT threads; thread t handles (row, expert) pairs t, t+NT, ... (R*E <= 4096).
+_ROUTE_META_SRC = r"""
+    threadgroup float keys[R * E];
+    threadgroup float sc[R * E];
+    threadgroup float sel_s[R * KT];
+    threadgroup uint sidx[R * KT];
+    threadgroup float denom_tg[R];
+    constexpr int NW = (E + 31) / 32;
+    threadgroup uint smask[NW];
+    const int t = (int)thread_position_in_threadgroup.x;
+    for (int i = t; i < R * E; i += NT) {
+        const int row = i / E, ex = i % E;
+        float xl = logits[(size_t)row * E + ex];
+        float y = 1 / (1 + metal::precise::exp(metal::abs(xl)));
+        const float s = (xl < 0) ? y : 1 - y;
+        sc[i] = s;
+        keys[i] = -(s + bias[ex]);
+    }
+    if (t < NW) smask[t] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = t; i < R * E; i += NT) {
+        const int row = i / E, ex = i % E;
+        const float kt = keys[i];
+        const bool tn = isnan(kt);
+        uint rank = 0;
+        for (int j = 0; j < E; ++j) {
+            float kj = keys[row * E + j];
+            bool jn = isnan(kj);
+            bool before = tn ? (jn ? j < ex : true) : (!jn && (kj < kt || (kj == kt && j < ex)));
+            rank += before ? 1u : 0u;
+        }
+        if (rank < (uint)KT) { sel_s[row * KT + rank] = sc[i]; sidx[row * KT + rank] = (uint)ex; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < R) {
+        float total = 0.0f;
+        for (int k = 0; k < KT; ++k) total = total + sel_s[t * KT + k];
+        denom_tg[t] = total + 1e-20f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = t; i < P; i += NT) {
+        const int row = i / KT;
+        idx[i] = sidx[i];
+        w[i] = sel_s[i] / denom_tg[row] * scale[0];
+        atomic_fetch_or_explicit((threadgroup atomic_uint*)&smask[sidx[i] >> 5], 1u << (sidx[i] & 31u),
+                                 memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int z = t; z < P; z += NT) {
+        int e = -1, cnt = 0;
+        for (int wd = 0; wd < NW && e < 0; wd++) {
+            const uint m = smask[wd];
+            const int c = (int)popcount(m);
+            if (z < cnt + c) {
+                uint mm = m;
+                for (int j = 0; j < z - cnt; j++) mm &= mm - 1u;
+                e = wd * 32 + (int)ctz(mm);
+            }
+            cnt += c;
+        }
+        device int* out = meta + z * (2 + R);
+        out[0] = e;
+        if (e < 0) continue;
+        int n = 0;
+        for (int p = 0; p < P; p++)
+            if ((int)sidx[p] == e) out[2 + n++] = p;
+        out[1] = n;
+    }
+"""
+
+# language._combine_routes in one launch: out[row, c] = T(sum_k f32(y[row*KT+k, c]) * w[row*KT+k]),
+# products rounded to f32 then summed in k order from 0 (MLX multiply kernel + sequential col reduce).
+_COMBINE_SRC = r"""
+    const int c = (int)thread_position_in_grid.x;
+    const int row = (int)thread_position_in_grid.y;
+    if (c >= D) return;
+    float acc = 0.0f;
+    for (int k = 0; k < KT; k++) {
+        const float pr = static_cast<float>(y[(size_t)(row * KT + k) * D + c]) * w[row * KT + k];
+        acc = spec_add_nc(acc, pr);
+    }
+    out[(size_t)row * D + c] = static_cast<T>(acc);
+"""
+_COMBINE_HDR = r"""
+#pragma clang fp contract(off)
+inline float spec_add_nc(float a, float b) { return a + b; }
+"""
+
 GUA_ROWS = int(os.environ.get("INKLING_SMOE_GUA_ROWS", "2"))
 GUA_SGS = int(os.environ.get("INKLING_SMOE_GUA_SGS", "4"))
 GUA_TV = int(os.environ.get("INKLING_SMOE_GUA_TV", "1"))
@@ -489,6 +931,21 @@ GUA_CH = int(os.environ.get("INKLING_SMOE_GUA_CH", "0"))  # 0: one row tile per 
 DOWN_CH = int(os.environ.get("INKLING_SMOE_DOWN_CH", "0"))
 ZFRAC = float(os.environ.get("INKLING_SMOE_ZFRAC", "0.6"))  # z slots / routes (distinct experts expected <~ this)
 MAX_ROWS = 16  # B*L rows handled (verify uses L <= 8)
+V2 = int(os.environ.get("INKLING_SMOE_V2", "1"))  # one-pass multi-token kernels
+G2_RG = int(os.environ.get("INKLING_SMOE_G2_RG", "2"))
+G2_SGS = int(os.environ.get("INKLING_SMOE_G2_SGS", "4"))
+G2_TV = int(os.environ.get("INKLING_SMOE_G2_TV", "2"))
+D2_RD = int(os.environ.get("INKLING_SMOE_D2_RD", "4"))
+D2_SGS = int(os.environ.get("INKLING_SMOE_D2_SGS", "2"))
+D2_TV = int(os.environ.get("INKLING_SMOE_D2_TV", "2"))
+RM = int(os.environ.get("INKLING_SMOE_RM", "0"))  # fused route_topk+meta: slower at B=16 (1 TG)
+RT2 = int(os.environ.get("INKLING_SMOE_RT2", "1"))  # router_rows2 (stored-dtype weights, RR rows/TG)
+F32IO = int(os.environ.get("INKLING_SMOE_F32IO", "0"))  # v2: x, act as exact f32 (no per-token bf16 unpack): no gain, off
+MC = int(os.environ.get("INKLING_SMOE_MC", "0"))  # v2: meta2 token chunks of G2_TV per TG slot (no gain; off)
+ROUTER_RR = int(os.environ.get("INKLING_SMOE_ROUTER_RR", "4"))
+G2_CH = int(os.environ.get("INKLING_SMOE_G2_CH", "1"))  # row tiles per threadgroup (amortizes the LUT build)
+D2_CH = int(os.environ.get("INKLING_SMOE_D2_CH", "1"))
+CMB = int(os.environ.get("INKLING_SMOE_CMB", "1"))  # one-launch combine  # fused route_topk + meta (one launch)
 
 _kern = {}
 _perf_hdr = ""  # tuning knobs (#define SPEC_PERF/SPEC_LUT/SPEC_XV) for benches
@@ -527,6 +984,110 @@ def router_rows(x2, w32):
         output_shapes=[(R, E)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+# Router logits for R rows, RR rows per threadgroup (weights loaded once for RR rows, all K-loads of a
+# thread issued up front), reading the router weight in its own dtype (bf16 -> f32 widening is exact, so
+# the values equal the cached f32 copy). Per (row, expert): exactly mega_kernels._ROUTER_SRC's sequence
+# (same per-thread K positions and FMA expression, shuffle_down tree, then SG partials summed in order).
+_ROUTER2_SRC = r"""
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint lid = thread_position_in_threadgroup.x;
+    const int out_row = (int)threadgroup_position_in_grid.x * 4;
+    const int r0 = (int)threadgroup_position_in_grid.y * RR;
+    threadgroup float tgp[RR * 64];
+    const device WT* mat = w + (size_t)out_row * K;
+    float result[RR][4];
+#pragma unroll
+    for (int r = 0; r < RR; r++)
+#pragma unroll
+        for (int tm = 0; tm < 4; tm++) result[r][tm] = 0;
+    const int bn0 = ((int)sg * 32 + (int)lane) * 4;
+    constexpr int NIT = K / 1024;
+    float inter[NIT + 1][4][4];
+#pragma unroll
+    for (int it = 0; it < NIT; ++it)
+#pragma unroll
+        for (int tm = 0; tm < 4; tm++)
+#pragma unroll
+            for (int t = 0; t < 4; t++) inter[it][tm][t] = static_cast<float>(mat[tm * K + bn0 + it * 1024 + t]);
+    const int bnr = bn0 + NIT * 1024;
+    const bool full = bnr + 4 <= K;
+    if (K % 1024 > 0) {
+#pragma unroll
+        for (int tm = 0; tm < 4; tm++)
+#pragma unroll
+            for (int t = 0; t < 4; t++)
+                inter[NIT][tm][t] = (full || bnr + t < K) ? static_cast<float>(mat[tm * K + bnr + t]) : 0.0f;
+    }
+#pragma unroll
+    for (int r = 0; r < RR; r++) {
+        if (r0 + r < R) {
+            const device T* xr = x + (size_t)(r0 + r) * K;
+#pragma unroll
+            for (int it = 0; it < NIT; ++it) {
+                float vc[4];
+#pragma unroll
+                for (int t = 0; t < 4; t++) vc[t] = static_cast<float>(xr[bn0 + it * 1024 + t]);
+#pragma unroll
+                for (int tm = 0; tm < 4; tm++)
+#pragma unroll
+                    for (int t = 0; t < 4; t++) result[r][tm] += inter[it][tm][t] * vc[t];
+            }
+            if (K % 1024 > 0) {
+                float vc[4];
+#pragma unroll
+                for (int t = 0; t < 4; t++) vc[t] = (full || bnr + t < K) ? static_cast<float>(xr[bnr + t]) : 0.0f;
+#pragma unroll
+                for (int tm = 0; tm < 4; tm++)
+#pragma unroll
+                    for (int t = 0; t < 4; t++) result[r][tm] += inter[NIT][tm][t] * vc[t];
+            }
+        }
+#pragma unroll
+        for (int tm = 0; tm < 4; tm++)
+            for (ushort s = 16; s >= 1; s >>= 1) result[r][tm] += simd_shuffle_down(result[r][tm], s);
+        if (lane == 0)
+#pragma unroll
+            for (int tm = 0; tm < 4; tm++) tgp[r * 64 + sg * 8 + tm] = result[r][tm];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int)lid < RR && r0 + (int)lid < R) {
+        const int r = (int)lid;
+        float acc[4];
+        for (int tm = 0; tm < 4; tm++) acc[tm] = tgp[r * 64 + tm];
+        for (int sgn = 1; sgn < 8; sgn++)
+            for (int tm = 0; tm < 4; tm++) acc[tm] += tgp[r * 64 + sgn * 8 + tm];
+        for (int tm = 0; tm < 4; tm++) logits[(size_t)(r0 + r) * E + out_row + tm] = acc[tm];
+    }
+#if XO
+    if (threadgroup_position_in_grid.x == 0)
+        for (int r = 0; r < RR; r++)
+            if (r0 + r < R)
+                for (int i = (int)lid; i < K; i += 256)
+                    x32[(size_t)(r0 + r) * K + i] = static_cast<float>(x[(size_t)(r0 + r) * K + i]);
+#endif
+"""
+
+
+def router_rows2(x2, w, x32=False):
+    """router_rows with the router weight in its stored dtype (bf16/f16/f32), RR rows per threadgroup.
+    x32=True also returns x2 widened to f32 (exact), written by the first expert-block threadgroups."""
+    R, K = x2.shape
+    E = w.shape[0]
+    rr = min(R, ROUTER_RR)
+    k = _kernel("router2x" if x32 else "router2", ["x", "w"], ["logits", "x32"] if x32 else ["logits"],
+                ("#define XO 1\n" if x32 else "#define XO 0\n") + _ROUTER2_SRC, "")
+    out = k(
+        inputs=[x2, w],
+        template=[("T", x2.dtype), ("WT", w.dtype), ("K", K), ("E", E), ("R", R), ("RR", rr)],
+        grid=(256 * (E // 4), (R + rr - 1) // rr, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(R, E), (R, K)] if x32 else [(R, E)],
+        output_dtypes=[mx.float32, mx.float32] if x32 else [mx.float32],
+    )
+    return (out[0], out[1]) if x32 else out[0]
 
 
 def _scale_mode(lin):
@@ -601,6 +1162,11 @@ def supported(moe, x, fused):
         return False
     if g.num_experts != E or u.num_experts != E or dn.num_experts != E:
         return False
+    if V2:
+        if (NH % (G2_RG * G2_SGS * G2_CH) or D % (D2_RD * D2_SGS * D2_CH) or G2_TV * G2_RG > 32
+                or D2_TV * D2_RD > 32):
+            return False
+        return fused is None or (fused.get("mode") == "nvfp4" and fused.get("n") == NH)
     gch, dch = _ch(NH, GUA_ROWS, GUA_SGS, GUA_CH), _ch(D, DOWN_ROWS, DOWN_SGS, DOWN_CH)
     if (not gch or not dch or NH % gch or (NH // gch) % GUA_ROWS or D % dch
             or (D // dch) % DOWN_ROWS):
@@ -631,14 +1197,47 @@ def moe_verify(moe, x, fused=None, stages=False, stages_act=None, routed=False):
     KT = int(moe.top_k)
     P = R * KT
     gch, dch = _ch(NH, GUA_ROWS, GUA_SGS, GUA_CH), _ch(D, DOWN_ROWS, DOWN_SGS, DOWN_CH)
-    logits = router_rows(x2, w32)
-    idx, wts = fk.route_topk(logits, moe.e_score_correction_bias, KT, moe.route_scale)
-    idx = idx.reshape(P)
+    gw = moe.gate_weight
+    f32io = bool(V2 and F32IO and x.dtype != mx.float32)
+    xg = x2
+    if RT2 and gw.dtype in (mx.bfloat16, mx.float16, mx.float32) and gw.shape == w32.shape:
+        if f32io:
+            logits, xg = router_rows2(x2, gw, x32=True)
+        else:
+            logits = router_rows2(x2, gw)
+    else:
+        logits = router_rows(x2, w32)
+        if f32io:
+            xg = x2.astype(mx.float32)
+    if stages == "upto_logits":
+        return logits
+    zs = max(1, min(P, E, int(math.ceil(P * ZFRAC))))
+    if RM and R * E <= 2048:
+        nt = min(1024, max(64, (R * E + 31) // 32 * 32))
+        idx, wts, meta = _kernel("route_meta", ["logits", "bias", "scale"], ["idx", "w", "meta"],
+                                 _ROUTE_META_SRC, "")(
+            inputs=[logits, moe.e_score_correction_bias.astype(mx.float32), fk._scalar(moe.route_scale)],
+            template=[("E", E), ("KT", KT), ("R", R), ("P", P), ("NT", nt)],
+            grid=(nt, 1, 1), threadgroup=(nt, 1, 1),
+            output_shapes=[(P,), (P,), (P * (2 + R),)],
+            output_dtypes=[mx.uint32, mx.float32, mx.int32])
+        if stages in ("upto_route", "upto_meta"):
+            return meta
+    else:
+        meta = None
+        idx, wts = fk.route_topk(logits, moe.e_score_correction_bias, KT, moe.route_scale)
+        idx = idx.reshape(P)
     if stages == "upto_route":
         return idx
     mt = max(32, (P + 31) // 32 * 32)
-    zs = max(1, min(P, E, int(math.ceil(P * ZFRAC))))
-    meta = _kernel("meta", ["idx"], ["meta"], _META_SRC, _QMV_HEADER + _SPEC_FN)(
+    rmax = R
+    if V2 and MC and G2_TV == D2_TV and meta is None:
+        rmax, zs = G2_TV, P
+        meta = _kernel("meta2", ["idx"], ["meta"], _META2_SRC, "")(
+            inputs=[idx], template=[("E", E), ("P", P), ("TV", G2_TV)],
+            grid=(mt, 1, 1), threadgroup=(mt, 1, 1),
+            output_shapes=[(P * (2 + G2_TV),)], output_dtypes=[mx.int32])[0]
+    meta = meta if meta is not None else _kernel("meta", ["idx"], ["meta"], _META_SRC, _QMV_HEADER + _SPEC_FN)(
         inputs=[idx], template=[("E", E), ("P", P), ("RMAX", R)],
         grid=(mt, 1, 1), threadgroup=(mt, 1, 1),
         output_shapes=[(P * (2 + R),)], output_dtypes=[mx.int32])[0]
@@ -654,6 +1253,56 @@ def moe_verify(moe, x, fused=None, stages=False, stages_act=None, routed=False):
         wg, sg, wu, su = g.weight, g.scales, u.weight, u.scales
         wr, uoff, samew = NH, 0, False
     caps = _caps(sm.activation.gate_cap, sm.activation.up_cap)
+    if V2:
+        gua2 = _kernel(
+            "gua2", ["meta", "x", "wg", "sgs", "gsg", "wu", "sus", "gsu", "caps"], ["act"],
+            _GUA2_SRC, _perf_hdr + _QMV_HEADER + _SPEC_FN + _V2_FN,
+        )
+        gch2 = NH // (G2_RG * G2_SGS * G2_CH)
+        act = gua2(
+            inputs=[meta, xg, wg, sg, gsg, wu, su, gsu, caps],
+            template=[("T", x.dtype), ("K", D), ("NOUT", NH), ("E", E), ("KT", KT), ("P", P),
+                      ("RMAX", rmax), ("GS", 16), ("RG", G2_RG), ("SGS", G2_SGS), ("TVM", G2_TV),
+                      ("FAST", _fast_variant(D)), ("WR", wr), ("UOFF", uoff), ("SAMEW", samew),
+                      ("SMG", smg), ("SMU", smu), ("GNG", gng), ("GNU", gnu), ("RPC", G2_RG * G2_SGS * G2_CH),
+                      ("ZS", zs)],
+            grid=(32, G2_SGS * gch2, zs),
+            threadgroup=(32, G2_SGS, 1),
+            output_shapes=[(P, NH)],
+            output_dtypes=[mx.float32 if f32io else x.dtype],
+        )[0]
+    else:
+        act = _gua_v1(meta, x, x2, wg, sg, gsg, wu, su, gsu, caps, D, NH, E, KT, P, R, wr, uoff,
+                      samew, smg, smu, gng, gnu, gch, zs)
+    if stages == "upto_gua":
+        return act
+    if stages == "act_in":
+        act = stages_act
+    smd, gsd, gnd = _scale_mode(dn)
+    if V2:
+        down2 = _kernel(
+            "down2", ["meta", "act", "w", "scales", "gs"], ["y"],
+            _DOWN2_SRC, _perf_hdr + _QMV_HEADER + _SPEC_FN + _V2_FN,
+        )
+        dch2 = D // (D2_RD * D2_SGS * D2_CH)
+        y = down2(
+            inputs=[meta, act, dn.weight, dn.scales, gsd],
+            template=[("T", x.dtype), ("K", NH), ("NOUT", D), ("E", E), ("P", P), ("RMAX", rmax),
+                      ("GS", 16), ("RD", D2_RD), ("SGS", D2_SGS), ("TVM", D2_TV),
+                      ("FAST", _fast_variant(NH)), ("SM", smd), ("GN", gnd), ("RPC", D2_RD * D2_SGS * D2_CH),
+                      ("ZS", zs)],
+            grid=(32, D2_SGS * dch2, zs),
+            threadgroup=(32, D2_SGS, 1),
+            output_shapes=[(P, D)],
+            output_dtypes=[x.dtype],
+        )[0]
+    else:
+        y = _down_v1(meta, act, dn, gsd, smd, gnd, x, D, NH, E, P, R, dch, zs)
+    return _tail(stages, idx, logits, wts, act, y, B, L, KT, D, E, P, R, routed)
+
+
+def _gua_v1(meta, x, x2, wg, sg, gsg, wu, su, gsu, caps, D, NH, E, KT, P, R, wr, uoff, samew,
+            smg, smu, gng, gnu, gch, zs):
     gua = _kernel(
         "gua", ["meta", "x", "wg", "sgs", "gsg", "wu", "sus", "gsu", "caps"], ["act"],
         _GUA_SRC, _perf_hdr + _QMV_HEADER + _SPEC_FN,
@@ -670,11 +1319,10 @@ def moe_verify(moe, x, fused=None, stages=False, stages_act=None, routed=False):
         output_shapes=[(P, NH)],
         output_dtypes=[x.dtype],
     )[0]
-    if stages == "upto_gua":
-        return act
-    if stages == "act_in":
-        act = stages_act
-    smd, gsd, gnd = _scale_mode(dn)
+    return act
+
+
+def _down_v1(meta, act, dn, gsd, smd, gnd, x, D, NH, E, P, R, dch, zs):
     down = _kernel(
         "down", ["meta", "act", "w", "scales", "gs"], ["y"],
         _DOWN_SRC, _perf_hdr + _QMV_HEADER + _SPEC_FN,
@@ -690,7 +1338,13 @@ def moe_verify(moe, x, fused=None, stages=False, stages_act=None, routed=False):
         output_shapes=[(P, D)],
         output_dtypes=[x.dtype],
     )[0]
-    if stages == "act_in":
+    return y
+
+
+def _tail(stages, idx, logits, wts, act, y, B, L, KT, D, E, P, R, routed):
+    from .language import _combine_routes
+
+    if stages in ("act_in", "upto_down"):
         return y
     if stages:
         probe = _kernel("probe", ["idx"], ["out"], _PROBE_SRC, _QMV_HEADER + _SPEC_FN)(
@@ -700,4 +1354,10 @@ def moe_verify(moe, x, fused=None, stages=False, stages_act=None, routed=False):
         return logits, idx, wts, act, y, probe
     if routed:  # per-route outputs + weights, as SparseMoE._routed (sconv_tail combines)
         return y.reshape(B, L, KT, D), wts.reshape(B, L, KT)
+    if CMB:
+        out = _kernel("combine", ["y", "w"], ["out"], _COMBINE_SRC, _COMBINE_HDR)(
+            inputs=[y, wts.reshape(P)], template=[("T", y.dtype), ("D", D), ("KT", KT)],
+            grid=((D + 255) // 256 * 256, R, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(R, D)], output_dtypes=[y.dtype])[0]
+        return out.reshape(B, L, D)
     return _combine_routes(y.reshape(B, L, KT, D), wts.reshape(B, L, KT))

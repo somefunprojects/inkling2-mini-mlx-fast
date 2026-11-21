@@ -234,6 +234,9 @@ def _kv_rows(kv):
     raise TypeError(f"unsupported cache {type(kv).__name__}")
 
 
+_BMOE_WARNED = set()  # (B, dtype, routed) shapes already warned about a stock MoE fallback
+
+
 class FastDecoder:
     def __init__(self, language_model, buckets=DEFAULT_BUCKETS, use_sinks=None,
                  reuse_keys=True, batch_ctrl=True, use_kernels=True, ring_extra=0,
@@ -1040,7 +1043,17 @@ class FastDecoder:
             return None
         from . import spec_moe
 
-        return spec_moe.moe_verify(moe, x, moe.fast_prepare(), routed=routed)
+        out = spec_moe.moe_verify(moe, x, moe.fast_prepare(), routed=routed)
+        if out is None:
+            # make the stock fallback visible (B > spec_moe.MAX_ROWS, MXFP8 layers, ...)
+            key = (x.shape[0], str(x.dtype), routed)
+            if key not in _BMOE_WARNED:
+                _BMOE_WARNED.add(key)
+                import sys
+                print(f"[inkling batchfast] moe: B={x.shape[0]} falls back to the stock MoE on some layers "
+                      f"(spec_moe.supported refused; MAX_ROWS={spec_moe.MAX_ROWS}, MXFP8 layers always stock)",
+                      file=sys.stderr, flush=True)
+        return out
 
     def _moe(self, moe, x):
         if x.shape[1] == 1:
