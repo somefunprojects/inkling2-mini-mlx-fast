@@ -19,13 +19,24 @@ For reference, stock `mlx-lm` (the fork at commit 0c4c991) on the same machine d
 
 ## Try it
 
-You need Python 3.12, MLX 0.32.4, and a pinned checkout of `mlx-vlm`. Pick a branch (`main` for plain decode, `batch` for batched decode, or `specfast` for speculative decoding), install `mlx-vlm`, and run the overlay script against the directory holding `mlx_vlm/`:
+You need Python 3.12 and a local copy of the Inkling 2 Mini weights. These commands set up `main` and run the plain decoding benchmark:
 
 ```bash
-pip install "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm.git@fd6404fb3261102600541127d59103dac65c2756"
-./install.sh /path/to/dir-containing-mlx_vlm
-INKLING_FAST_DECODE=1 python your_script.py
+git clone https://github.com/somefunprojects/inkling2-mini-mlx-fast
+cd inkling2-mini-mlx-fast
+python3.12 -m venv .venv
+. .venv/bin/activate
+pip install mlx==0.32.4 "mlx-vlm @ git+https://github.com/Neywa-Labs/mlx-vlm.git@fd6404fb3261102600541127d59103dac65c2756"
+./install.sh .venv/lib/python3.12/site-packages
+
+export INKLING_MODEL=/path/to/Inkling-2-Mini
+python bench/build_prompts.py
+export INKLING_FAST=$(sed -n 's/^ALL31=//p' run_tests.sh)
+export INKLING_FAST_DECODE=1
+python bench/bench.py --skip-batch --sampler off
 ```
+
+It prints decode speed in tok/s at 512 and 4K context; it doesn't print generated text. The `batch` and `specfast` branches have the batched and speculative modes.
 
 Check [DETAILS.md](DETAILS.md) for the test runner, kernel flags, and benchmark scripts.
 
