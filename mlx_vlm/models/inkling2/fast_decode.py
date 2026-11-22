@@ -1,7 +1,7 @@
 # Copyright (c) 2026 somefunprojects. MIT License (see LICENSE).
 """Static-shape, mx.compile'd single-token decode for Inkling 2 (PLAN item #4).
 
-Prefill stays on stock mlx-vlm.  ``FastDecoder.from_cache`` converts the stock
+Prefill stays on the normal mlx-vlm path (INKLING_FAST kernels stay on).  ``FastDecoder.from_cache`` converts the stock
 prompt cache into fixed-shape state arrays, and ``FastDecoder.step`` runs one
 decode token (L=1) for all 48 layer visits as ONE compiled graph:
 
@@ -18,12 +18,15 @@ decode token (L=1) for all 48 layer visits as ONE compiled graph:
 * position: ``q_pos`` [B] int32, passed as an array, so nothing in the traced
   function depends on a Python value that changes per step.
 
-The arithmetic mirrors ``language.py`` op for op (same submodules, same FP32
-islands and casts).  Deliberate differences, all reduction-order only:
+In the approximate path (``exact=False`` / INKLING_FAST_DECODE_APPROX=1) the
+arithmetic mirrors ``language.py`` op for op (same submodules, same FP32
+islands and casts).  Its deliberate differences, all reduction-order only:
 key order inside SDPA (physical vs temporal), masked padding slots in the
 global buffer, the rel-bias dot as an FP32 matmul instead of the mask kernel's
 serial loop, and (B == 1) the sink via SDPA ``sinks=`` instead of a zero K/V
-column.  Flags: INKLING_FAST_SINKS=0 forces the zero-slot sink path.
+column.  The default exact path instead gives decode attention the stock SDPA
+operands (see ``exact`` in ``__init__``).  Flags: INKLING_FAST_SINKS=0 forces
+the zero-slot sink path.
 
 Composes with INKLING_FAST (fast_kernels.py): ``mask`` -> slot_mask kernel,
 ``fuse`` -> fused [q;r;gate] / [k;v] GEMVs (B == 1), ``glue`` / ``fusemoe``
@@ -31,20 +34,23 @@ Composes with INKLING_FAST (fast_kernels.py): ``mask`` -> slot_mask kernel,
 those paths create is built in ``_prepare`` BEFORE tracing (an array cached
 from inside a trace would be a tracer).
 
-Exact restructurings of our own (on by default, kwargs to disable):
+Restructurings of our own (on by default, kwargs to disable):
 ``reuse_keys``: rms_norm(block) is computed once when a block is appended and
-reused by every later AttentionResidual / message bank (row-wise op, so
-bitwise); ``batch_ctrl``: the attn/k/v MessageControllers of a core visit run
-as one batched computation over stacked [3, ...] weights.
+reused by every later AttentionResidual / message bank (a row-wise op, so we
+expect it to be bitwise; it was in our B=1 runs, but not in some batched
+tests, see DETAILS.md "Known limits"); ``batch_ctrl``: the attn/k/v
+MessageControllers of a core visit run as one batched computation over
+stacked [3, ...] weights, only for B*L <= 8.
 
-Batched decode: B rows with different (left-padded) lengths are supported;
+Batched decode: B rows with different (left-padded) lengths are refused
+in the default exact mode unless INKLING_FAST_DECODE_PADDED=1, and then not bitwise; in that mode
 each row keeps its own logical positions (q_pos[b]); pads never enter the
 buffers (slot_pos = -1).
 
-Falls back to stock (``Unsupported``): sharded models are refused at
+Falls back to the normal mlx-vlm path, INKLING_FAST kernels on (``Unsupported``): sharded models are refused at
 construction; a prompt beyond the largest bucket is refused by from_cache;
 decoding past the largest bucket converts back with ``to_cache`` and
-continues on the stock path inside ``step``.  The compiled graph captures the
+continues on that path inside ``step``.  The compiled graph captures the
 weights at trace time: build a new FastDecoder after load_weights / LoRA.
 
 Planned: compiled block verify (DSpark, L = 2..8) on the same state.
@@ -90,7 +96,7 @@ def _loud(msg):
 
 
 class Unsupported(Exception):
-    """FastDecoder cannot take this model/cache; callers use the stock path."""
+    """FastDecoder cannot take this model/cache; callers use the normal mlx-vlm path."""
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
 
@@ -180,7 +186,7 @@ def _grouped_qmv(x, weight, scales, factor, ids, n, V=2):
 
 
 def _attn_res_keys(bkeys, partial, query, normalize_values, states=None):
-    """_attention_residual with cached per-block rms_norm keys (exact)."""
+    """_attention_residual with cached per-block rms_norm keys (meant to match; batches: see DETAILS.md "Known limits")."""
     pk = mx.fast.rms_norm(partial.astype(mx.float32)[..., None, :], None, 1e-6)
     keys = mx.concatenate([*bkeys, pk], axis=-2)
     D = keys.shape[-1]
@@ -320,8 +326,8 @@ class FastDecoder:
         self.k_fuse = on_gpu and fk.enabled("fuse")
         # exact (default): decode (L=1) attention gets the stock SDPA operands
         # -- temporal key order, the sink as a zero key at index S, an N that
-        # selects the stock kernel config -- so B=1 decode is bitwise vs the
-        # stock language path. INKLING_FAST_DECODE_APPROX=1 (or exact=False)
+        # selects the stock kernel config -- so B=1 decode was bitwise vs the
+        # stock language path in the gated runs. INKLING_FAST_DECODE_APPROX=1 (or exact=False)
         # restores the old physical-order / sinks= path (not bitwise).
         if exact is None:
             exact = os.environ.get("INKLING_FAST_DECODE_APPROX", "0") != "1"
@@ -339,7 +345,7 @@ class FastDecoder:
                             (cfg.swa_num_attention_heads, cfg.swa_num_key_value_heads)):
                 limits.update(_sdpa_cap_limits(nq, nkv))
             # Boundaries inside the configured range only (the largest bucket
-            # still decides when to fall back to stock).
+            # still decides when to leave for the normal mlx-vlm path).
             top = max(self.buckets)
             self.buckets = tuple(sorted(set(self.buckets) | {t for t in limits if t < top}))
             # The sliced sliding regime (cap < W) must not wrap.
@@ -354,7 +360,7 @@ class FastDecoder:
         self.dedup = os.environ.get("INKLING_FAST_VERIFY_DEDUP", "1") != "0"
         self.dedup_v = int(os.environ.get("INKLING_FAST_VERIFY_V", "2"))
         self.tokenwise_moe = os.environ.get("INKLING_FAST_VERIFY_TOKENWISE", "1") != "0"
-        # expert-grouped verify MoE extensions (verify_dedup.py), bitwise vs decode rows.
+        # expert-grouped verify MoE extensions (verify_dedup.py), meant to match decode rows.
         self.ds_dedup_mxfp8 = os.environ.get("INKLING_DS_DEDUP_MXFP8", "0") == "1"
         self.ds_dedup_down = os.environ.get("INKLING_DS_DEDUP_DOWN", "0") == "1"
         self.ds_route_tokenwise = os.environ.get("INKLING_DS_ROUTE_TOKENWISE", "0") == "1"
@@ -462,8 +468,10 @@ class FastDecoder:
                 and os.environ.get("INKLING_FAST_DECODE_PADDED", "0") != "1"):
             # Review F2: on left-padded batches the exact path is not bitwise
             # vs stock's padded layout (key indices and SDPA N differ), and
-            # FP32-exactness is unproven. Callers fall back to stock.
+            # FP32-exactness is unproven. Callers use the normal path (INKLING_FAST kernels stay on).
             # INKLING_FAST_DECODE_PADDED=1 opts in (non-bitwise).
+            # Equal-length batches were only checked in limited configurations
+            # (see DETAILS.md "Known limits").
             raise Unsupported("left-padded batch: exact FastDecoder is bitwise only for equal row lengths")
         B = len(lengths)
         cap = self._bucket_for(max(lengths) + 1)  # raises Unsupported if too long
@@ -911,7 +919,7 @@ class FastDecoder:
             P = min(self._xp_stable, len(bkeys)) if self.xpass else 0
             if P and partial.size // partial.shape[-1] <= 16:
                 # INKLING_FAST=xpass: depth logits of the blocks that repeat in
-                # every loop pass, computed once per step (bitwise, see
+                # every loop pass, computed once per step (not always bitwise in batches; see
                 # fast_kernels.attention_residual_keyed).
                 entry = self._xp_memo.get(id(module))
                 prefix = tuple(bkeys[:P])
@@ -927,7 +935,7 @@ class FastDecoder:
         return module(blocks, partial)
 
     # MoE for verify (L>1): group all B*L*k routes by expert so each expert's
-    # NVFP4 gate/up weights are read once per group (bitwise vs decode's QMV).
+    # NVFP4 gate/up weights are read once per group (meant to match decode's QMV).
     def _moe_dedup_ok(self, moe):
         from ..masked_quantized import supports_masked_qmv
 
@@ -1386,7 +1394,7 @@ class FastDecoder:
         """tokens: [B, 1] int.  Returns (logits [B, V] fp32, argmax [B] int32).
 
         Past the largest bucket the state is converted back into a stock
-        cache (``to_cache``) and decoding continues on the stock path."""
+        cache (``to_cache``) and decoding continues on the normal path (INKLING_FAST kernels stay on)."""
         tokens = tokens.astype(mx.int32)
         if self.fallback is None:
             self._fit_bounded(1)  # review F1: a cap grown by verify past p+1 changes N
@@ -1541,7 +1549,7 @@ def enabled():
 
 def generate_fast(model, processor, prompt, max_tokens=256, prefill_step=2048,
                   logits_hook=None, eos_token_ids=None, decoder_kwargs=None):
-    """Greedy: stock prefill, convert cache, loop the compiled step with
+    """Greedy: normal-path prefill, convert cache, loop the compiled step with
     async_eval pipelining.  ``logits_hook(step, logits)`` sees each step's
     logits (forces a sync per step when given).  Returns list of token ids."""
     tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor

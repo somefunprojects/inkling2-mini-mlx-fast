@@ -978,7 +978,8 @@ class AttentionResidual(nn.Module):
             # INKLING_FAST=attnres (with xpass keys): one kernel.
             return _fast.attn_res(blocks.keys, partial, self.query)
         if isinstance(blocks, _fast.KeyedBlocks) and self.normalize_values:
-            # INKLING_FAST=xpass: cached block keys + cross-pass depth logits.
+            # INKLING_FAST=xpass: cached block keys + cross-pass depth logits
+            # (not always bitwise in batches: see DETAILS.md "Known limits").
             return _fast.attention_residual_keyed(
                 self, blocks, partial, reuse_logits=_FAST_XPASS_LOGITS
             )
@@ -1177,7 +1178,7 @@ class TextModel(nn.Module):
                     # Only completed core blocks and the last partial supply messages.
                     first = len(prelude_blocks) + 1
                     if xpass:
-                        # Same rows as rms_norm(stack(...)): row-wise, bitwise.
+                        # Same rows as rms_norm(stack(...)): row-wise, expected to match.
                         bank = mx.concatenate(
                             [*blocks.keys[first:], _fast._block_key(x)], axis=-2
                         )

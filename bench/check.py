@@ -4,8 +4,8 @@ Teacher forcing makes KL meaningful past a divergence; argmax-match at every ste
 Two bars:
   BITWISE        every step's full-vocab fp32 logits equal the stock full ref (--full-ref, built once with
                  `check.py --save-full` on UNMODIFIED stock code). Reports max|dlogit| and non-bitwise step count.
-  NONBITWISE-OK  not bitwise, but overall mean KL(top-64) <= --kl-floor (stock prefill-chunk noise floor,
-                 2.68e-3 measured for chunk 1024). Also needs a separate FP32-exactness test on the tiny
+  NONBITWISE-OK  not bitwise, but overall mean KL(top-64) <= --kl-floor (2.68e-3: stock against itself when only
+                 the prefill chunk changes, 2048 vs 1024; not two identical runs). Also needs a separate FP32-exactness test on the tiny
                  model, which this script cannot judge (a reminder is printed).
   FAIL           otherwise.
 Exit 0 iff a bar is met (--require-bitwise: only BITWISE). The old per-prompt lines and the final
@@ -20,7 +20,7 @@ import numpy as np
 import mlx.core as mx
 from common import *
 
-KL_NOISE_FLOOR = 2.68e-3  # stock, prefill chunk 2048 -> 1024 (stock-vs-stock noise floor)
+KL_NOISE_FLOOR = 2.68e-3  # stock vs stock, prefill chunk 2048 -> 1024 (not two identical runs)
 FULL_REF_DIR = os.path.join(REF_DIR, "full")
 
 def kl_topk(ref_ids, ref_lp, new_full_lp):
