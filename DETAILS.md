@@ -26,7 +26,7 @@ To run benchmarks, build prompts with `INKLING_MODEL=/path/to/Inkling-2-Mini INK
 
 ## Test machine and weights
 
-Every number below was measured on a Mac with an Apple M5 Ultra (64-core GPU, `applegpu_g17d`, 96 GB unified memory), macOS 27.2.1, Python 3.12, MLX 0.32.4, and `mlx-vlm` at `fd6404fb`. Decoding is greedy, B=1 unless noted, and the GPU-utilisation sampler is off during timing. "Stock `mlx-vlm`" means unmodified `mlx-vlm` at that commit with no flags.
+Every number below was measured on a Mac with an Apple M5 Ultra (64-core GPU, `applegpu_g17d`, 96 GB unified memory), macOS 27.2.1, Python 3.12, MLX 0.32.4, and `mlx-vlm` at `fd6404fb`. Decoding is greedy, B=1 unless noted. The GPU-utilisation sampler is off during timing, except for the plain 512 and 4K rows of the single-stream table (both columns and the reruns; the same rows are in the README): their script ran it inside the timed loop. "Stock `mlx-vlm`" means unmodified `mlx-vlm` at that commit with no flags.
 
 Weights are the shipped Inkling 2 Mini release with no requantization: NVFP4 experts in layers 0-19, MXFP8 experts in layers 20-23, and bf16 for attention, controllers, router, embedding, and LM head.
 
@@ -57,21 +57,21 @@ Prefill is essentially unchanged; the real speedups are in decode.
 
 ### Batched decode (`batch` branch, drafting off, aggregate tok/s)
 
-Measured on equal-length rows of 512 tokens that share no tokens with each other (distinct prompts: even rows are natural-language passages, odd rows non-overlapping code and documentation slices), 128 decode steps, sampler off, 3 repetitions in one session, spread at most 3.3%:
+The FastDecoder and `BATCHFAST` columns were measured on equal-length rows of 512 tokens that share no tokens with each other (distinct prompts: even rows are natural-language passages, odd rows non-overlapping code and documentation slices), 128 decode steps, sampler off, 3 repetitions per B, spread at most 3.3%:
 
-| Context | B | FastDecoder (no BATCHFAST) | Ours (`BATCHFAST=all`) | Stock `mlx-vlm` | Drafting | Exactness |
+| Context | B | FastDecoder (no BATCHFAST) | Ours (`BATCHFAST=all`) | Not stock (our flags on, overlapping rows) | Drafting | Exactness |
 |---|---|---|---|---|---|---|
 | 512 | 4 | 153.7 | 222.2 | 111.1 | Off | NONBITWISE-OK (gated at 256/1K/4K) |
 | 512 | 8 | 232.6 | 321.8 | 175.6 | Off | NONBITWISE-OK (gated at 256/1K/4K) |
 | 512 | 16 | 301.6 | 420.1 | 249.7 | Off | NONBITWISE-OK (gated at 256/1K/4K) |
 
-The two middle columns come from the same session on the same rows. The stock `mlx-vlm` column is from a separate session. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stayed bitwise exact in the runs we checked (MLX default settings).
+The two middle columns come from the same session on the same rows. The column to their right is not stock, and earlier versions of this page were wrong to call it that: it is the normal `mlx-vlm` path with the same 31 `INKLING_FAST` flags on, from a separate session at an earlier commit, on overlapping rows (512-token slices 97 tokens apart), 2 repetitions. Stock wasn't timed in this loop at B>1. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stayed bitwise exact in the runs we checked (MLX default settings).
 
 Only the NVFP4 MoE layers use the new batched kernels. The 4 MXFP8 MoE layers, and all MoE layers above B=16 (with a warning on stderr), use the normal `mlx-vlm` MoE path instead, which keeps any `INKLING_FAST` kernels on, so it is not the same as stock.
 
 ### Reference points from other engines (same machine)
 
-We ran two other engines on the same Mac to see where we stand. They use their own prompt handling, so treat the comparison as rough. Batch 1, bf16 KV cache, median of 3 repetitions after 1 warm-up, spread at most 0.3%. Weights are the same released Inkling 2 Mini checkpoint, loaded read-only. Prompts are token ids from our stdlib-source prompt builder.
+We ran two other engines on the same Mac to see where we stand. They use their own prompt handling, so treat the comparison as rough. Batch 1, bf16 KV cache. Decode is the median of 3 repetitions after a warm-up, with a spread of at most 1% in the figures shown. Weights are the same released Inkling 2 Mini checkpoint, loaded read-only. Prompts are token ids from our stdlib-source prompt builder.
 
 Stock `mlx-lm` (the `jundot/mlx-lm` fork at commit 0c4c991, which `inkling-infer` pins):
 
@@ -81,18 +81,18 @@ Stock `mlx-lm` (the `jundot/mlx-lm` fork at commit 0c4c991, which `inkling-infer
 | Decode, 4000-token context | 45.0 | 76.7 |
 | Prefill, 4,096 tokens, 1,024-token chunks, no `lm_head` | 3,344 | 3,122 |
 
-Our plain decode is therefore about 1.6-1.7x stock `mlx-lm` (73.5 / 45.0 with the harness numbers above, 76.7 / 45.0 in this same-session check). Measured the same way, our prefill is about 7% slower than stock `mlx-lm`: a fresh 4,096-token cache, 1,024-token chunks, hidden state and cache evaluated per chunk, `lm_head` never run, median of 5 repetitions. Per 1,024-token chunk that is 290 / 310 / 316 / 305 ms for stock `mlx-lm` and 306 / 331 / 332 / 338 ms for ours (chunk offsets 0 / 1K / 2K / 3K). Timing the two components separately points to attention: stock `mlx-lm` uses one fused relative-attention kernel, while ours builds a dense mask and calls SDPA. The MoE experts take the same time in both (about 130 ms per chunk), and our short convolution is faster.
+Our plain decode is therefore about 1.6-1.7x stock `mlx-lm` (73.5 / 45.0 with the harness numbers above, 76.7 / 45.0 from separate runs on the same prompt ids). Measured the same way, our prefill is about 7% slower than stock `mlx-lm`: a fresh 4,096-token cache, 1,024-token chunks, hidden state and cache evaluated per chunk, `lm_head` never run, median of 5 repetitions. Per 1,024-token chunk that is 290 / 310 / 316 / 305 ms for stock `mlx-lm` and 306 / 331 / 332 / 338 ms for ours (chunk offsets 0 / 1K / 2K / 3K). Timing the two components separately points to attention: stock `mlx-lm` uses one fused relative-attention kernel, while ours builds a dense mask and calls SDPA. The MoE experts take the same time in both (about 130 ms per chunk), and our short convolution is faster.
 
 Other prefill figures differ by definition and are not directly comparable with this row: stock `mlx-lm` reaches up to about 3.7K tok/s with a 2,048-token chunk and no `lm_head`, and the prefill figures in the Prefill section above come from a harness that also computes the last-row logits.
 
-[inkling-infer](https://github.com/razorback16/inkling-infer) (repo commit 87d0e22), run locally with its own scripts and unmodified code: decode is 109.1 tok/s at 4000-token context, faster than ours (76.7 in the same check), and about 67 tok/s for prompts under 1K (ours: 82.0). Its fast path appears to engage once the sliding-window ring buffers fill, around 1K of context. Its prefill kernels measured 1.9-2.2K tok/s here, below ours and below its own stock path. Its decode is not bitwise with stock `mlx-lm` (teacher-forced mean KL 1.3-1.8e-3 over 41 steps, 2-3 argmax flips per run). We read its code for safety only and copied nothing.
+[inkling-infer](https://github.com/razorback16/inkling-infer) (repo commit 87d0e22), run locally with unmodified code, timed by our own greedy driver around its kernels: decode is 109.1 tok/s at 4000-token context, faster than ours (76.7 on the same prompt ids, in an earlier separate run), and about 67 tok/s for prompts under 1K (ours: 82.0). Its fast path appears to engage once the sliding-window ring buffers fill, around 1K of context. Its prefill kernels measured 1.9-2.2K tok/s here, below ours and below its own stock path. Its decode is not bitwise with stock `mlx-lm` (teacher-forced mean KL 1.3-1.8e-3 over 41 steps, 2-3 argmax flips per run). We read its code for safety only and copied nothing.
 
 ## Correctness gates
 
 We use two labels:
 
 - `BITWISE`: fp32 logits identical to stock `mlx-vlm` at every checked step. We claim it only for these plain B=1 runs, with the full flag list, `MLX_ENABLE_TF32` unset and stock prefilled by the same loop as ours (2048-token chunks, last token included; not `mlx_vlm.generate`'s split): 8 prompts x 256 steps, starting at 43-64, ~1.5K and ~4K tokens (0/2048 differing), the same 3 texts, each cut to 300, 512 and 768 tokens, x 256 decode steps per cut (on `main`: 0/2,313 logit rows differing, prefill logits included, both in `FastDecoder` and on the normal `mlx-vlm` path with the flags), ~1K and ~8K starts (0/512), 32K (2 prompts x 128 steps) and 64K (1 prompt x 128 steps). With `SPECFAST` off, the `specfast` branch also matches stock `mlx-vlm` 512/512. Batched decode is not claimed `BITWISE`: see Known limits. At 96K and 128K stock does not reproduce itself, so there is no verdict. Separately, on the tiny random-weight model with the full flag list (`BATCHFAST` and `SPECFAST` off), B=1 matched stock in all 336 short-prompt runs: 1, 2, 3, 4, 8, 20 and 40 tokens, two seeds, all three branches, `MLX_ENABLE_TF32` unset and 0, two decoder settings, two repeats each, 89-128 steps compared.
-- `NONBITWISE-OK`: mean teacher-forced KL over a gate run is at most 2.68e-3 (`BATCHFAST`: full vocabulary, against stock batched decode; other gates and the bar itself: top-64). Single prompts and steps can be higher. The bar is stock against itself at prefill chunk 2048 vs 1024, averaged over 8 prompts x 256 steps up to 4K (the four short prompts differ by 0, the four longer ones by 5.0e-3 to 5.7e-3). It is not the difference between identical runs, and not meaningful at 96K+.
+- `NONBITWISE-OK`: mean teacher-forced KL over a gate run is at most 2.68e-3 (`BATCHFAST`: full vocabulary, against batched decode on our tree with no flags; other gates and the bar itself: top-64). Single prompts and steps can be higher. The bar is our tree with no flags (an earlier commit) at prefill chunk 1024 against stock at 2048, averaged over 8 prompts x 256 steps up to 4K (the four short prompts differ by 0, the four longer ones by 5.0e-3 to 5.7e-3). It is not the difference between identical runs, and not meaningful at 96K+.
   - `BATCHFAST` at B>1 measures 2.1e-4 to 7.2e-4 mean KL at 256 context, with worst cases of 1.55e-3 at 1K and 1.61e-3 at 4K. Each gate was 24 steps; single steps reach 0.20. The gate rows were not the distinct prompts of the speed table: they were overlapping document slices, offset by 97 tokens.
   - `SPECFAST` measures 1.72e-3 KL64 at n=3 and 1.52e-3 at n=4.
 
