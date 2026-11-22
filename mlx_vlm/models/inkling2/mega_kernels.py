@@ -3,8 +3,8 @@
 
 Goal: fewer GPU dispatches per decode token (CPU
 encode is ~2.2-2.9 us per launch at B=1). Each block reproduces the MLX
-kernels it replaces in the same reduction order, so results are bitwise vs
-the op chain it replaces (unit tests in tests_fast/test_mega.py).
+kernels it replaces in the same reduction order, so results are meant to be bitwise vs
+the op chain it replaces.
 
 Flags (each independent; all need B*L == 1, GPU, BF16 weights):
 * ``mega_ctrl``  MessageController(s): rms_norm(x), rms_norm(message), concat,

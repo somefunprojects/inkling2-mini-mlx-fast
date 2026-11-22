@@ -1,4 +1,4 @@
-"""FastDecoder._moe (verify, L>1, expert-grouped) vs decode-path MoE per position: bitwise (bf16).
+"""FastDecoder._moe (verify, L>1, expert-grouped) vs decode-path MoE per position: meant to match decode rows (bf16); one known unfused L=8 mismatch with MLX_ENABLE_TF32 unset.
 Run with INKLING_FAST=all to cover the fused gate+up buffer (scales forced equal)."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

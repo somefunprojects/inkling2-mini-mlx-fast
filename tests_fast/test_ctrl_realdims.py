@@ -1,4 +1,4 @@
-"""Batched controllers / cached-key AttentionResidual at real Inkling-2-Mini dims (D=2304, r=64), bitwise."""
+"""Batched controllers / cached-key AttentionResidual at real Inkling-2-Mini dims (D=2304, r=64); bitwise up to B=8 in our runs, ctrl3 differs at B=16 (the decoder gates it to B*L <= 8)."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny  # package stubs

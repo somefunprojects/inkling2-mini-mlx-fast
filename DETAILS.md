@@ -4,23 +4,23 @@ Full setup instructions, benchmark tables, correctness checks, known limits, and
 
 ## Setup, branches, and flags
 
-The overlay targets Python 3.12, MLX 0.32.4, and `mlx-vlm` at commit `fd6404fb3261102600541127d59103dac65c2756`. That commit reports version 0.8.0, though its Inkling 2 files differ from the PyPI 0.8.0 wheel. The bitwise kernels are pinned to MLX 0.32.4 and this GPU architecture; running on another MLX version raises an error unless `INKLING_FAST_UNVERIFIED_OK=1` is set.
+The overlay targets Python 3.12, MLX 0.32.4, and `mlx-vlm` at commit `fd6404fb3261102600541127d59103dac65c2756`. That commit reports version 0.8.0, though its Inkling 2 files differ from the PyPI 0.8.0 wheel. The bitwise kernels are pinned to MLX 0.32.4 and this GPU architecture; running on another MLX version raises an error unless `INKLING_FAST_UNVERIFIED_OK=<your MLX version>` is set.
 
-Three branches hold the reviewed code as-is (only licence headers and comment wording were edited):
+Three branches hold the code:
 
-- `main`: plain B=1 decode and batching that stays compatible with stock `mlx-vlm`.
+- `main`: plain B=1 decode and batched decode (see Known limits).
 - `batch`: `main` plus `INKLING_BATCHFAST` kernels for B>1 decode.
 - `specfast`: `main` plus `INKLING_SPECFAST` kernels for speculative decoding with the model's bundled DSpark drafter.
 
 Running `./install.sh <dir containing mlx_vlm/>` checks the upstream `language.py` SHA256 (`--force` skips the check), backs up overwritten files as `*.orig`, and copies `tests_fast/`, `tests.txt`, and `run_tests.sh` into `<dir>`. Run `./run_tests.sh python` from `<dir>` to execute the tiny random-weight unit tests (no model download needed; requires a Metal GPU).
 
-Runtime flags (default behaviour with no flags is stock `mlx-vlm`):
+Runtime flags (existing scripts with no flags run stock `mlx-vlm`):
 
-- `INKLING_FAST_DECODE=1` and `INKLING_FAST=<31-flag list>`: turns on the compiled `FastDecoder` and fused Metal kernels (the full 31-flag list is `$ALL31` in `run_tests.sh`).
+- `INKLING_FAST=<31-flag list>`: enables the fused Metal kernels used by `FastDecoder` (the full 31-flag list is `$ALL31` in `run_tests.sh`). Installing alone does not change an existing script, but setting `INKLING_FAST` also switches on kernels in the normal `mlx-vlm` path, where batched output can then differ from stock (see Known limits). For the compiled decoder, call `generate_fast(model, processor, prompt)` from `mlx_vlm.models.inkling2.fast_decode`, or build a `FastDecoder`. `generate_fast` takes one prompt (raw text, no chat template, or token ids), returns token ids, and stops at EOS only if given `eos_token_ids`. Its prefill keeps the last token in the last chunk, while `mlx_vlm.generate` feeds it separately, so their outputs can differ. `INKLING_FAST_DECODE=1` is read only by the scripts in `bench/`, where it makes them build a `FastDecoder`; it does not affect other scripts.
 - `INKLING_BATCHFAST=all`: enables batched decode kernels (`batch` branch).
 - `INKLING_FAST_VERIFY=1 INKLING_SPECFAST=all`: enables speculative verify and fast kernels (`specfast` branch).
 - `INKLING_FAST_DECODE_PADDED=1`: opts into unequal-length (left-padded) batches.
-- `INKLING_FAST_UNVERIFIED_OK=1`: bypasses the MLX version and GPU arch check.
+- `INKLING_FAST_UNVERIFIED_OK=<your MLX version>`: skips the startup check; `mega_*` kernels stay off on an unverified MLX or GPU.
 
 To run benchmarks, build prompts with `INKLING_MODEL=/path/to/Inkling-2-Mini INKLING_RUNS=./runs python bench/build_prompts.py` (reads `INKLING_PROMPTS`, defaulting to `bench/prompts.json`), then run scripts in `bench/` (such as `bench/bench.py`, `bench/bench_bdec.py`, or `bench/spec_bench.py`) with `bench/` and the `mlx-vlm` tree on `PYTHONPATH`. `bench/common.py` refuses jobs estimated above 55 GB.
 
@@ -61,13 +61,13 @@ Measured on equal-length rows of 512 tokens that share no tokens with each other
 
 | Context | B | FastDecoder (no BATCHFAST) | Ours (`BATCHFAST=all`) | Stock `mlx-vlm` | Drafting | Exactness |
 |---|---|---|---|---|---|---|
-| 512 | 4 | 153.7 | 222.2 | 111.1 | Off | NONBITWISE-OK |
-| 512 | 8 | 232.6 | 321.8 | 175.6 | Off | NONBITWISE-OK |
-| 512 | 16 | 301.6 | 420.1 | 249.7 | Off | NONBITWISE-OK |
+| 512 | 4 | 153.7 | 222.2 | 111.1 | Off | NONBITWISE-OK (gated at 256/1K/4K) |
+| 512 | 8 | 232.6 | 321.8 | 175.6 | Off | NONBITWISE-OK (gated at 256/1K/4K) |
+| 512 | 16 | 301.6 | 420.1 | 249.7 | Off | NONBITWISE-OK (gated at 256/1K/4K) |
 
-The two middle columns come from the same session on the same rows. The stock `mlx-vlm` column is from a separate session. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stays bitwise exact.
+The two middle columns come from the same session on the same rows. The stock `mlx-vlm` column is from a separate session. At B=16 the batched MoE kernels (one pass over each expert's weights for all rows routed to it) account for most of the gain over the previous batched path (354.4 tok/s at B=16 on the same rows). The shipped harness (`bench/bench_bdec.py`) builds overlapping stdlib-source slices instead; on overlapping rows B=16 measured about 0.8% higher. At B=1 with `BATCHFAST` enabled, output stayed bitwise exact in the runs we checked (MLX default settings).
 
-Only the NVFP4 MoE layers use the new batched kernels. The 4 MXFP8 MoE layers still use stock `mlx-vlm` kernels. The batched MoE path falls back to stock `mlx-vlm` above B=16 (with a one-time warning on stderr).
+Only the NVFP4 MoE layers use the new batched kernels. The 4 MXFP8 MoE layers, and all MoE layers above B=16 (with a warning on stderr), use the normal `mlx-vlm` MoE path instead, which keeps any `INKLING_FAST` kernels on, so it is not the same as stock.
 
 ### Reference points from other engines (same machine)
 
@@ -91,17 +91,25 @@ Other prefill figures differ by definition and are not directly comparable with 
 
 We use two labels:
 
-- `BITWISE`: logits identical to stock `mlx-vlm` at every step. This holds for plain B=1 decode (0 differing steps out of 2048 across 8 prompts x 256), ~1K and ~8K starts (0/512), equal-length batches without `BATCHFAST`, 32K (2 prompts), and 64K (1 prompt). With `SPECFAST` off, the `specfast` branch also matches stock `mlx-vlm` 512/512. At 96K and 128K stock `mlx-vlm` is not reproducible against itself, so there is no verdict.
-- `NONBITWISE-OK`: top-64 teacher-forced KL against stock `mlx-vlm` stays under 2.68e-3, which is the run-to-run noise of stock `mlx-vlm` against itself measured when only the prefill chunk size changes from 2048 to 1024 (8 prompts x 256 steps, calibrated on prompts up to 4K; not meaningful at 96K+).
-  - `BATCHFAST` at B>1 measures 2.1e-4 to 7.2e-4 mean KL at 256 context, with worst cases of 1.55e-3 at 1K and 1.61e-3 at 4K.
-  - `SPECFAST` measures 1.72e-3 KL64 at n=3 and 1.52e-3 at n=4. Tiny FP32 verify tests pass with TF32 off (row diffs up to 1.9e-6).
+- `BITWISE`: fp32 logits identical to stock `mlx-vlm` at every checked step. We claim it only for these plain B=1 runs, with the full flag list, `MLX_ENABLE_TF32` unset and stock prefilled by the same loop as ours (2048-token chunks, last token included; not `mlx_vlm.generate`'s split): 8 prompts x 256 steps, starting at 43-64, ~1.5K and ~4K tokens (0/2048 differing), the same 3 texts, each cut to 300, 512 and 768 tokens, x 256 decode steps per cut (on `main`: 0/2,313 logit rows differing, prefill logits included, both in `FastDecoder` and on the normal `mlx-vlm` path with the flags), ~1K and ~8K starts (0/512), 32K (2 prompts x 128 steps) and 64K (1 prompt x 128 steps). With `SPECFAST` off, the `specfast` branch also matches stock `mlx-vlm` 512/512. Batched decode is not claimed `BITWISE`: see Known limits. At 96K and 128K stock does not reproduce itself, so there is no verdict. Separately, on the tiny random-weight model with the full flag list (`BATCHFAST` and `SPECFAST` off), B=1 matched stock in all 336 short-prompt runs: 1, 2, 3, 4, 8, 20 and 40 tokens, two seeds, all three branches, `MLX_ENABLE_TF32` unset and 0, two decoder settings, two repeats each, 89-128 steps compared.
+- `NONBITWISE-OK`: mean teacher-forced KL over a gate run is at most 2.68e-3 (`BATCHFAST`: full vocabulary, against stock batched decode; other gates and the bar itself: top-64). Single prompts and steps can be higher. The bar is stock against itself at prefill chunk 2048 vs 1024, averaged over 8 prompts x 256 steps up to 4K (the four short prompts differ by 0, the four longer ones by 5.0e-3 to 5.7e-3). It is not the difference between identical runs, and not meaningful at 96K+.
+  - `BATCHFAST` at B>1 measures 2.1e-4 to 7.2e-4 mean KL at 256 context, with worst cases of 1.55e-3 at 1K and 1.61e-3 at 4K. Each gate was 24 steps; single steps reach 0.20. The gate rows were not the distinct prompts of the speed table: they were overlapping document slices, offset by 97 tokens.
+  - `SPECFAST` measures 1.72e-3 KL64 at n=3 and 1.52e-3 at n=4.
 
 ## Known limits
 
-- Context past 131072 tokens: plain decode falls back to stock `mlx-vlm`; the speculative path currently crashes past 131072 (a fix exists and will land in a later update).
+- Correction: earlier versions of this page listed equal-length batches without `BATCHFAST` under `BITWISE`; that was wrong.
+- Batches (B>1) are not bitwise. With `INKLING_FAST` set, they can differ from stock both in `FastDecoder` and on the normal `mlx-vlm` path (no `FastDecoder`). The cause is unknown and we have no workaround. On a tiny random-weight bfloat16 model with equal-length rows, the largest differences we saw, by environment:
+  - `MLX_ENABLE_TF32` unset, no `BATCHFAST`: max |dlogit| 1.23e-2, with no top-token changes in that case (4-token rows, B=8, 100 of 124 steps differing).
+  - `MLX_ENABLE_TF32=0`, no `BATCHFAST`: max |dlogit| 0.894, and up to 8 top-token changes per case. In one case (4-token rows, B=4) the prefill logits already differed.
+  - `batch` with `BATCHFAST=all`, `MLX_ENABLE_TF32` unset: max |dlogit| 0.728 and 18 top-token changes (4-token rows, B=8).
+  On real weights, `BATCHFAST=all` with `MLX_ENABLE_TF32` unset differed at every decode step of every row in the gates under Correctness gates: max |dlogit| 7.34 (B=16, 4K) and at most 3 top-token changes per case (B=16, 1K: 3 of 384 step-row pairs). Without `BATCHFAST`, left-padded real-weight batches also differed in `FastDecoder` (opt-in, see the unequal-length limit below); equal-length ones were compared in a few configurations only, too few to say whether they can differ.
+- Test gaps: `run_tests.sh` passes with an empty or missing test list, and some shipped tests don't check that the kernel they cover ran.
+- The gate at 300, 512 and 768 tokens (see Correctness gates) doesn't cover three things: whether the 10 flags without a kernel counter engaged (`ctrlbatch`, `fuse`, `fusemoe`, `glue`, `mega_attnres`, `mega_kvip`, `mega_kvz`, `moesort`, `msgpack`, `xpass`; of the other 21, the `xmask` and `mega_rg2` kernels never ran here: in `FastDecoder` other flags' kernels replace them), batches (B>1), and `mlx_vlm.generate`. It compared logits only; the speed numbers on this page were not timed again.
+- Decoding past 131072 tokens: plain decode falls back to the normal `mlx-vlm` path, which keeps any `INKLING_FAST` kernels on, so it is not the same as stock and has the batch limit above. At B=1 that hand-off is untested for bitwise output (`test_spec_fallback` on `specfast` compares tokens only, in FP32). A prompt already too long for that limit is refused by `FastDecoder.from_cache`; `generate_fast` then uses the normal path. The speculative path currently crashes past 131072 (a fix exists and will land in a later update).
 - Verify-pass KL near context 1000-1256: KL exceeds the 2.68e-3 bar even on the base (non-`specfast`) path, reaching 6.82e-3 for `specfast` at n=3 before settling back down at 2000. Our original gate prompts did not cross ~1024.
-- Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs the MoE layers on stock `mlx-vlm` kernels (one-time warning), no chat batch test, MXFP8 MoE layers still use stock `mlx-vlm` kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
-- Unequal-length (left-padded) batches are refused unless `INKLING_FAST_DECODE_PADDED=1` is set, and that mode is not bitwise (KL about 1e-3).
+- Batched decode gaps: gated only up to 4K context (8K-32K could cross the bar), B=32 never run, B>16 runs the MoE layers on the normal `mlx-vlm` path, with any `INKLING_FAST` kernels on (with a warning), no chat batch test, MXFP8 MoE layers don't use the batched kernels, and `FastDecoder` is not wired into `batch_generate` or the server.
+- Unequal-length (left-padded) batches are refused in the default exact mode unless `INKLING_FAST_DECODE_PADDED=1` is set, and that mode is not bitwise (KL about 1e-3).
 - Prefill is about 7% slower than stock `mlx-lm` when both are timed the same way (see the reference-points section); the difference is in attention.
 - A reference cycle keeps KV buffers alive until Python GC runs, which matters for long-running servers.
 - `attnres` at L>1 is not FP32-tested.

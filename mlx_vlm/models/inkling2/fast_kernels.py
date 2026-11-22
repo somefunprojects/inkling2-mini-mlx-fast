@@ -916,17 +916,17 @@ controllers3_compiled = mx.compile(_controllers3)
 
 
 # --------------------------------------------------------------------------
-# 8. xpass: exact cross-pass reuse in AttentionResidual (stock path).
+# 8. xpass: cross-pass reuse in AttentionResidual (stock path and FastDecoder).
 # --------------------------------------------------------------------------
 # (a) rms_norm(block) is computed once, when the block is appended (row-wise
-#     op: bitwise vs normalising the stacked states every call).
+#     op: expected to match normalising the stacked states every call).
 # (b) Depth logits keys @ query.T for blocks that are identical across loop
 #     passes (prelude blocks + the prelude partial appended at core_start)
 #     are computed once per step per AttentionResidual and reused by passes
 #     2..N. Bitwise caveat: MLX picks a different matmul kernel when a piece
 #     has a single row (M=1), so such pieces are padded to two rows; with that
-#     every split reproduces the full matmul's rows exactly for B*L <= 24
-#     (tested); larger M (prefill) tiles differently, so reuse is gated to
+#     every split reproduced the full matmul's rows exactly in component tests on an M4 Pro
+#     for B*L <= 24 (end-to-end batches can differ: see DETAILS.md); larger M (prefill) tiles differently, so reuse is gated to
 #     B*L <= 16.
 
 
@@ -994,7 +994,8 @@ def depth_scores(keys_list, query):
 def attention_residual_keyed(module, blocks, partial, reuse_logits=True):
     """AttentionResidual.__call__ for KeyedBlocks (normalize_values=True)."""
     rows = partial.size // partial.shape[-1]
-    # Split-matmul rows match the full matmul bitwise for B*L <= 24 on M4 Pro
+    # Split-matmul rows matched the full matmul in component tests for B*L <= 24 on M4 Pro
+    # (end-to-end batches can differ: see DETAILS.md "Known limits")
     # (not at >= 32: other GEMM tiling), so reuse only for decode/verify sizes.
     P = min(blocks.stable, len(blocks)) if reuse_logits and rows <= 16 else 0
     if P == 0:
@@ -1026,8 +1027,8 @@ def packed_messages(queries, bank):
 
     queries: [n_core, 4, D]; bank: [..., nb, D]. Returns [..., n_core, 4, D].
     The batched matmuls use the same kernels and per-row reduction as the
-    per-layer [4, D] ones (verified bitwise at B=1/4, nb=2/3, compiled or
-    not, on the M5 Ultra; tests_fast/test_port.py).
+    per-layer [4, D] ones (matched in component runs at B=1/4, nb=2/3, compiled or
+    not, on the M5 Ultra; end-to-end batches can differ, see DETAILS.md).
     """
     b = bank[..., None, :, :]
     scores = (queries @ b.swapaxes(-1, -2)) * bank.shape[-1] ** -0.5
