@@ -546,7 +546,7 @@ _ROUTER_ROWS_PRE = r"""
 # + an fp8 scale LUT built with q_dequantize_scale's own conversion) and applies them to up to TVM
 # tokens whose accumulators stay in registers; the per-(token, row) arithmetic is unchanged
 # (spec_qdot_d at stock's function boundary, same lane partition, same block order, simd_sum),
-# so every row stays bitwise equal to the L=1 decode path. Epilogues are spread over lanes.
+# so every row is meant to stay equal to the L=1 decode path. Epilogues are spread over lanes.
 _V2_FN = r"""
 #ifndef SPEC_PF
 #define SPEC_PF 1

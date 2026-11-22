@@ -1,7 +1,7 @@
 """Review F2/F4 guards (tiny model; run with FORK on PYTHONPATH, any INKLING_FAST).
 1. check_exact_runtime refuses an unverified MLX version unless INKLING_FAST_UNVERIFIED_OK=<ver>.
 2. Exact FastDecoder raises Unsupported on left-padded (unequal) batches, and on use_kernels=False.
-3. Equal-length B=4 batch: exact FD still bitwise vs stock batch caches."""
+3. Equal-length B=4 batch: checks exact FD against the normal mlx-vlm path in the same process, not stock when INKLING_FAST is set (this case only; other batches can differ, see DETAILS.md)."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny
@@ -68,7 +68,7 @@ except Unsupported:
     print("2c exact without kernels refused: True")
 FastDecoder(lm, buckets=(32, 64, 128), use_kernels=False, exact=False); print("2d approx without kernels allowed: True")
 
-# 3. equal-length batch stays bitwise
+# 3. equal-length batch, this case only (other batches can differ: see DETAILS.md)
 ids = mx.array(rng.integers(1, 500, size=(4, 12)).astype(np.int32))
 toks = rng.integers(1, 500, size=(30, 4)).astype(np.int32)
 c1 = batch_cache([0, 0, 0, 0]); c2 = batch_cache([0, 0, 0, 0])

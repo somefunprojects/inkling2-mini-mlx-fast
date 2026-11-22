@@ -1,4 +1,6 @@
-"""reuse_keys / batch_ctrl must be bitwise identical to the plain FastDecoder (bf16)."""
+"""reuse_keys / batch_ctrl are meant to be bitwise identical to the plain FastDecoder (bf16).
+
+With MLX_ENABLE_TF32=0 and the INKLING_FAST flags it prints a nonzero difference at B=16 (known limit, see DETAILS.md; it does not cover the failing default-settings case); it has no pass/fail verdict and exits 0."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny, numpy as np, mlx.core as mx
