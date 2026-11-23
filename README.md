@@ -1,5 +1,9 @@
 # inkling2-mini-mlx-fast
 
+> **Archived (November 2026).** We've stopped working on this. For running Inkling 2 Mini on a Mac we now use [mlx-serve](https://github.com/ddalcu/mlx-serve), which serves many requests at once. Everything here is kept as a record and isn't maintained.
+>
+> The branches: `main` has the plain fast decode plus greedy speculative decoding at B=1 (merged from `specfast`, so `specfast` points at the same commit). `batch` has the B>1 batched decode kernels; it was never merged into `main` and lives only on its own branch.
+
 This is a small speed overlay for running the Inkling 2 Mini model (text path only) on Apple Silicon with MLX, built on top of `mlx-vlm`. It keeps the official released weights completely untouched and cuts per-token GPU overhead with a compiled decode loop and custom Metal kernels. On our Mac, that roughly doubles plain decoding speed compared with stock `mlx-vlm`, while keeping identical logits in the single-prompt (B=1), default-setting plain runs we list as bit-exact (see the note below the table; drafting, batches, and one known non-default case differ). Everything sits behind opt-in flags, so default runs still behave like stock `mlx-vlm`.
 
 ## What we measured
